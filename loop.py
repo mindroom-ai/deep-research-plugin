@@ -20,12 +20,21 @@ WALL_CLOCK_SECONDS_CAP = 150 * 60
 MAX_QUERIES_PER_ROUND = 5
 MAX_QUERIES_PER_ROUND_CAP = 10
 RESULTS_PER_QUERY = 10
-RESULTS_PER_QUERY_CAP = 10
+RESULTS_PER_QUERY_CAP = 30
 MAX_READS_PER_ROUND = 10
 MAX_READS_PER_ROUND_CAP = 20
 REPORT_TOKEN_CAP = 8_000
 REPORT_CHAR_CAP = REPORT_TOKEN_CAP * 4
 NO_PROGRESS_LIMIT = 2
+OP_TIMEOUT_SECONDS = 120.0
+RETRY_ATTEMPTS = 2
+RETRY_BACKOFF_SECONDS = 0.5
+MAX_CONCURRENCY = 5
+FACTS_PER_SOURCE_CAP = 20
+EVIDENCE_DIGEST_CHAR_CAP = 20_000
+RECENT_QUERIES_PROMPT_CAP = 15
+FETCHED_URLS_PROMPT_CAP = 20
+UNVETTED_EXCERPT_CHARS = 400
 
 StructuredT = TypeVar("StructuredT", bound=BaseModel)
 AwaitedT = TypeVar("AwaitedT")
@@ -95,6 +104,7 @@ class LoopResult(BaseModel):
     stopped_reason: Literal["confident", "model_finished", "max_rounds", "wall_clock", "no_progress"]
     elapsed_seconds: float
     warnings: list[str]
+    stats: dict[str, int] = {}
 
 
 ReasonFn = Callable[[str], Awaitable[object]]
@@ -108,6 +118,14 @@ ClockFn = Callable[[], float]
 
 class _WallClockExpired(TimeoutError):
     """Raised when the remaining research wall-clock budget expires."""
+
+    def __init__(self, label: str) -> None:
+        super().__init__(label)
+        self.label = label
+
+
+class _OpTimeoutError(TimeoutError):
+    """Raised when one network operation exceeds its per-operation timeout."""
 
     def __init__(self, label: str) -> None:
         super().__init__(label)
@@ -142,6 +160,51 @@ class _WallClockBudget:
                 raise _WallClockExpired(label) from exc
             raise
 
+    async def wait_for_op(
+        self,
+        label: str,
+        fn: Callable[[], Awaitable[AwaitedT]],
+        op_timeout_seconds: float,
+    ) -> AwaitedT:
+        """Like wait_for, but additionally bounded by a per-operation timeout."""
+        remaining = self.remaining()
+        if remaining <= 0:
+            raise _WallClockExpired(label)
+        budget_limited = remaining <= op_timeout_seconds
+        timeout = asyncio.timeout(min(remaining, op_timeout_seconds))
+        try:
+            async with timeout:
+                return await fn()
+        except TimeoutError as exc:
+            if timeout.expired():
+                if budget_limited:
+                    raise _WallClockExpired(label) from exc
+                raise _OpTimeoutError(label) from exc
+            raise
+
+
+async def _attempt_with_retries(
+    label: str,
+    fn: Callable[[], Awaitable[AwaitedT]],
+    *,
+    budget: _WallClockBudget,
+    op_timeout_seconds: float,
+    backoff_seconds: float,
+    attempts: int = RETRY_ATTEMPTS,
+) -> AwaitedT:
+    """Run one bounded network operation with transient-failure retries."""
+    for attempt in range(attempts):
+        try:
+            return await budget.wait_for_op(label, fn, op_timeout_seconds)
+        except _WallClockExpired:
+            raise
+        except Exception:
+            if attempt + 1 >= attempts or budget.remaining() <= backoff_seconds:
+                raise
+            await asyncio.sleep(backoff_seconds)
+    msg = f"retry loop exhausted for {label}"  # pragma: no cover
+    raise RuntimeError(msg)  # pragma: no cover
+
 
 def clamp_int(value: int, *, minimum: int, maximum: int) -> int:
     """Clamp an integer value to a closed range."""
@@ -149,24 +212,45 @@ def clamp_int(value: int, *, minimum: int, maximum: int) -> int:
 
 
 def truncate_report(text: str, max_chars: int = REPORT_CHAR_CAP) -> str:
-    """Hard-truncate the rolling report to the configured approximate token cap."""
+    """Truncate the rolling report to its budget, preferring a paragraph boundary."""
     if len(text) <= max_chars:
         return text
-    return text[: max_chars - 28].rstrip() + "\n\n[truncated to budget]"
+    cut = text[: max_chars - 28]
+    boundary = cut.rfind("\n\n")
+    if boundary > max_chars // 2:
+        cut = cut[:boundary]
+    return cut.rstrip() + "\n\n[truncated to budget]"
+
+
+_THINK_BLOCK_RE = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+
+
+def _json_candidates(text: str) -> list[str]:
+    cleaned = _THINK_BLOCK_RE.sub("", text).strip()
+    candidates = [match.group(1).strip() for match in _FENCED_JSON_RE.finditer(cleaned)]
+    candidates.append(cleaned)
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(cleaned[start : end + 1])
+    return [candidate for candidate in candidates if candidate]
 
 
 def _validate_structured(value: object, schema: type[StructuredT]) -> StructuredT:
     if isinstance(value, schema):
         return value
     if isinstance(value, str):
-        try:
-            return schema.model_validate_json(value)
-        except ValidationError:
-            start = value.find("{")
-            end = value.rfind("}")
-            if start >= 0 and end > start:
-                return schema.model_validate_json(value[start : end + 1])
-            raise
+        last_error: Exception | None = None
+        for candidate in _json_candidates(value):
+            try:
+                return schema.model_validate_json(candidate)
+            except ValidationError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        msg = "structured response was empty"
+        raise ValueError(msg)
     return schema.model_validate(value)
 
 
@@ -328,12 +412,6 @@ def _ensure_sources_section(
     return f"{repaired_body}\n\n## Sources\n" + ("\n".join(source_lines) if source_lines else "(none)")
 
 
-def _evidence_line(source: SourceRecord, text: str) -> str:
-    if text:
-        return f"[{source.id}] {source.title} - {source.url}: {text}"
-    return f"[{source.id}] {source.title} - {source.url}"
-
-
 def _candidate_line(hit: SearchHit) -> str:
     title = hit.title.strip() or hit.url
     snippet = hit.snippet.strip()
@@ -348,6 +426,24 @@ def _final_workspace(report: str, pending_evidence: Sequence[str]) -> str:
         return report
     evidence_text = "\n".join(f"- {item}" for item in useful_evidence)
     return f"{report.rstrip()}\n\nUnsynthesized evidence from the final round:\n{evidence_text}".strip()
+
+
+def _evidence_digest(
+    facts_by_source: dict[int, list[str]],
+    max_chars: int = EVIDENCE_DIGEST_CHAR_CAP,
+) -> list[str]:
+    """Flatten the per-source fact bank into bounded [n]-prefixed evidence lines."""
+    lines: list[str] = []
+    total = 0
+    for source_id in sorted(facts_by_source):
+        for fact in facts_by_source[source_id]:
+            line = f"[{source_id}] {fact}"
+            total += len(line) + 1
+            if total > max_chars:
+                lines.append("(evidence digest truncated to budget)")
+                return lines
+            lines.append(line)
+    return lines
 
 
 def _has_valid_citations(report: str, sources_by_url: dict[str, SourceRecord]) -> bool:
@@ -370,6 +466,46 @@ def _wall_clock_warning(label: str) -> str:
     return f"wall clock expired during {label}"
 
 
+async def _run_worker_batch(
+    workers: Sequence[tuple[list[str], Awaitable[None]]],
+    *,
+    budget: _WallClockBudget,
+    warnings: list[str],
+    max_concurrency: int,
+) -> bool:
+    """Run (phase-label, worker) pairs concurrently; return True if the wall clock expired."""
+    if not workers:
+        return False
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+    async def guarded(worker: Awaitable[None]) -> None:
+        async with semaphore:
+            await worker
+
+    tasks = [asyncio.create_task(guarded(worker)) for _, worker in workers]
+    remaining = budget.remaining()
+    if remaining <= 0:
+        pending = set(tasks)
+    else:
+        _, pending = await asyncio.wait(tasks, timeout=remaining)
+    expired = bool(pending)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    for task, (phase, _) in zip(tasks, workers, strict=True):
+        if task in pending:
+            warnings.append(_wall_clock_warning(phase[0]))
+            continue
+        exc = task.exception()
+        if isinstance(exc, _WallClockExpired):
+            expired = True
+            warnings.append(_wall_clock_warning(exc.label))
+        elif exc is not None:
+            warnings.append(f"{phase[0]} failed unexpectedly: {exc}")
+    return expired
+
+
 async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     *,
     question: str,
@@ -387,6 +523,9 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     results_per_query: int = RESULTS_PER_QUERY,
     max_reads_per_round: int = MAX_READS_PER_ROUND,
     report_char_cap: int = REPORT_CHAR_CAP,
+    op_timeout_seconds: float = OP_TIMEOUT_SECONDS,
+    retry_backoff_seconds: float = RETRY_BACKOFF_SECONDS,
+    max_concurrency: int = MAX_CONCURRENCY,
 ) -> LoopResult:
     """Run the bounded research loop using injected LLM and network callables."""
     max_rounds = clamp_int(max_rounds, minimum=1, maximum=MAX_ROUNDS_CAP)
@@ -400,6 +539,15 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     max_reads_per_round = clamp_int(max_reads_per_round, minimum=1, maximum=MAX_READS_PER_ROUND_CAP)
 
     warnings: list[str] = []
+    stats = {
+        "searches": 0,
+        "search_failures": 0,
+        "reads": 0,
+        "read_failures": 0,
+        "extractions": 0,
+        "duplicate_queries_skipped": 0,
+        "duplicate_reads_skipped": 0,
+    }
     start = clock() if budget_start is None else budget_start
     budget = _WallClockBudget(start=start, seconds=wall_clock_seconds, clock=clock)
     report = ""
@@ -407,28 +555,56 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     rounds_used = 0
     stopped_reason: Literal["confident", "model_finished", "max_rounds", "wall_clock", "no_progress"] = "max_rounds"
     sources_by_url: dict[str, SourceRecord] = {}
-    sources_considered = 0
+    facts_by_source: dict[int, list[str]] = {}
+    considered_urls: set[str] = set()
+    executed_query_keys: set[str] = set()
+    executed_queries: list[str] = []
+    attempted_read_urls: set[str] = set()
+    attempted_read_order: list[str] = []
+    candidate_meta: dict[str, tuple[str, str]] = {}
     no_progress_counter = 0
     seen_evidence: set[str] = set()
 
-    try:
-        seed_hits = _coerce_hits(
-            await budget.wait_for(
-                "seed search",
-                lambda: search_fn(SearchQuery(query=question), results_per_query),
-            ),
+    def _query_key(query: SearchQuery) -> str:
+        return f"{query.kind}:{' '.join(query.query.lower().split())}"
+
+    async def _search_once(query: SearchQuery, label: str) -> list[SearchHit]:
+        stats["searches"] += 1
+        raw = await _attempt_with_retries(
+            label,
+            lambda: search_fn(query, results_per_query),
+            budget=budget,
+            op_timeout_seconds=op_timeout_seconds,
+            backoff_seconds=retry_backoff_seconds,
         )
+        return _coerce_hits(raw)
+
+    def _note_candidate(hit: SearchHit) -> str:
+        url = hit.url.strip()
+        considered_urls.add(url)
+        candidate_meta.setdefault(url, (hit.title, hit.snippet))
+        return _candidate_line(hit)
+
+    seed_query = SearchQuery(query=question)
+    executed_query_keys.add(_query_key(seed_query))
+    executed_queries.append(question)
+    try:
+        seed_hits = await _search_once(seed_query, "seed search")
     except _WallClockExpired as exc:
         warnings.append(_wall_clock_warning(exc.label))
         seed_hits = []
         stopped_reason = "wall_clock"
+    except _OpTimeoutError as exc:
+        stats["search_failures"] += 1
+        warnings.append(f"timed out during {exc.label}")
+        seed_hits = []
     except Exception as exc:
+        stats["search_failures"] += 1
         warnings.append(f"seed search failed: {exc}")
         seed_hits = []
     pending_evidence: list[str] = []
     for hit in seed_hits[:results_per_query]:
-        sources_considered += 1
-        evidence_line = _candidate_line(hit)
+        evidence_line = _note_candidate(hit)
         seen_evidence.add(evidence_line)
         pending_evidence.append(evidence_line)
     if not pending_evidence:
@@ -447,15 +623,23 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
             pending_evidence=pending_evidence,
             sources=_source_lines(sources_by_url),
             budget_left=f"{max_rounds - rounds_used} rounds; {wall_clock_seconds - int(clock() - start)} seconds",
+            max_queries=max_queries_per_round,
+            max_reads=max_reads_per_round,
+            recent_queries=executed_queries[-RECENT_QUERIES_PROMPT_CAP:],
+            fetched_urls=attempted_read_order[-FETCHED_URLS_PROMPT_CAP:],
         )
         fallback_step = ResearchStep(
-            thought="Structured reasoner output failed; finishing with current report.",
+            thought="Structured reasoner output failed; skipping this round.",
             updated_report=report,
             open_questions=[],
             confidence=confidence,
-            next_action="finish",
+            next_action="search",
         )
+        reasoner_failed = False
+
         def fallback_reasoner_step(step: ResearchStep = fallback_step) -> ResearchStep:
+            nonlocal reasoner_failed
+            reasoner_failed = True
             return step
 
         try:
@@ -497,78 +681,147 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
                 warnings.append(_wall_clock_warning(exc.label))
                 break
 
-        if confidence >= CONFIDENCE_STOP:
+        if confidence >= CONFIDENCE_STOP and sources_by_url:
             stopped_reason = "confident"
             break
         if step.next_action == "finish":
             stopped_reason = "model_finished"
             break
 
+        planned_queries: list[SearchQuery] = []
+        for query in step.search_queries:
+            if len(planned_queries) >= max_queries_per_round:
+                break
+            if not query.query.strip():
+                continue
+            key = _query_key(query)
+            if key in executed_query_keys:
+                stats["duplicate_queries_skipped"] += 1
+                continue
+            executed_query_keys.add(key)
+            executed_queries.append(query.query)
+            planned_queries.append(query)
+
+        planned_urls: list[str] = []
+        for raw_url in step.read_urls:
+            if len(planned_urls) >= max_reads_per_round:
+                break
+            url = raw_url.strip()
+            if not url:
+                continue
+            if url in attempted_read_urls:
+                stats["duplicate_reads_skipped"] += 1
+                continue
+            attempted_read_urls.add(url)
+            attempted_read_order.append(url)
+            planned_urls.append(url)
+
+        search_results: dict[int, list[SearchHit]] = {}
+        read_results: dict[int, tuple[str, Page, Extraction]] = {}
+
+        async def search_worker(index: int, query: SearchQuery, phase: list[str]) -> None:
+            try:
+                search_results[index] = await _search_once(query, phase[0])
+            except _WallClockExpired:
+                raise
+            except _OpTimeoutError:
+                stats["search_failures"] += 1
+                warnings.append(f"timed out during {phase[0]}")
+            except Exception as exc:
+                stats["search_failures"] += 1
+                warnings.append(f"search failed for {query.query}: {exc}")
+
+        async def read_worker(index: int, url: str, phase: list[str]) -> None:
+            stats["reads"] += 1
+            try:
+                page = _coerce_page(
+                    await _attempt_with_retries(
+                        phase[0],
+                        lambda: read_fn(url),
+                        budget=budget,
+                        op_timeout_seconds=op_timeout_seconds,
+                        backoff_seconds=retry_backoff_seconds,
+                    ),
+                    url,
+                )
+            except _WallClockExpired:
+                raise
+            except _OpTimeoutError:
+                stats["read_failures"] += 1
+                warnings.append(f"timed out during {phase[0]}")
+                return
+            except Exception as exc:
+                stats["read_failures"] += 1
+                warnings.append(f"read failed for {url}: {exc}")
+                return
+            phase[0] = f"extractor for {url}"
+            stats["extractions"] += 1
+            excerpt = " ".join(page.text.split())[:UNVETTED_EXCERPT_CHARS]
+
+            def fallback_extraction() -> Extraction:
+                if excerpt:
+                    return Extraction(facts=[f"Unvetted page excerpt: {excerpt}"], relevant=True)
+                return Extraction(facts=[], relevant=False)
+
+            extraction = await _call_structured_with_retry(
+                extract_fn,
+                extractor_prompt(question=question, url=url, page_text=page.text),
+                Extraction,
+                fallback_extraction,
+                warnings,
+                phase[0],
+                budget,
+            )
+            read_results[index] = (url, page, extraction)
+
+        workers: list[tuple[list[str], Awaitable[None]]] = []
+        for index, query in enumerate(planned_queries):
+            phase = [f"search for {query.query}"]
+            workers.append((phase, search_worker(index, query, phase)))
+        for index, url in enumerate(planned_urls):
+            phase = [f"read for {url}"]
+            workers.append((phase, read_worker(index, url, phase)))
+
+        if await _run_worker_batch(workers, budget=budget, warnings=warnings, max_concurrency=max_concurrency):
+            stopped_reason = "wall_clock"
+
         evidence: list[str] = []
         made_progress = False
-        if step.next_action == "search":
-            for query in step.search_queries[:max_queries_per_round]:
-                try:
-                    hits = _coerce_hits(
-                        await budget.wait_for(
-                            f"search for {query.query}",
-                            lambda query=query: search_fn(query, results_per_query),
-                        ),
-                    )
-                except _WallClockExpired as exc:
-                    stopped_reason = "wall_clock"
-                    warnings.append(_wall_clock_warning(exc.label))
-                    break
-                except Exception as exc:
-                    warnings.append(f"search failed for {query.query}: {exc}")
+        for index in sorted(search_results):
+            for hit in search_results[index][:results_per_query]:
+                evidence_line = _note_candidate(hit)
+                if evidence_line not in seen_evidence:
+                    made_progress = True
+                seen_evidence.add(evidence_line)
+                evidence.append(evidence_line)
+
+        for index in sorted(read_results):
+            url, page, extraction = read_results[index]
+            considered_urls.add(url)
+            if not extraction.relevant:
+                continue
+            candidate_title, candidate_snippet = candidate_meta.get(url, ("", ""))
+            title = page.title.strip()
+            if not title or title == page.url:
+                title = candidate_title
+            source, is_new = _register_source(
+                sources_by_url,
+                url=page.url,
+                title=title,
+                snippet=candidate_snippet,
+            )
+            source_facts = facts_by_source.setdefault(source.id, [])
+            for fact in extraction.facts:
+                fact = fact.strip()
+                if not fact:
                     continue
-                for hit in hits[:results_per_query]:
-                    sources_considered += 1
-                    evidence_line = _candidate_line(hit)
-                    if evidence_line not in seen_evidence:
-                        made_progress = True
-                    seen_evidence.add(evidence_line)
-                    evidence.append(evidence_line)
-        elif step.next_action == "read":
-            for url in step.read_urls[:max_reads_per_round]:
-                sources_considered += 1
-                try:
-                    page = _coerce_page(
-                        await budget.wait_for(f"read for {url}", lambda url=url: read_fn(url)),
-                        url,
-                    )
-                except _WallClockExpired as exc:
-                    stopped_reason = "wall_clock"
-                    warnings.append(_wall_clock_warning(exc.label))
-                    break
-                except Exception as exc:
-                    warnings.append(f"read failed for {url}: {exc}")
-                    continue
-                try:
-                    extract = await _call_structured_with_retry(
-                        extract_fn,
-                        extractor_prompt(question=question, url=url, page_text=page.text),
-                        Extraction,
-                        lambda: Extraction(facts=[], relevant=False),
-                        warnings,
-                        "extractor",
-                        budget,
-                    )
-                except _WallClockExpired as exc:
-                    stopped_reason = "wall_clock"
-                    warnings.append(_wall_clock_warning(exc.label))
-                    break
-                if extract.relevant:
-                    source, is_new = _register_source(sources_by_url, url=page.url, title=page.title, snippet="")
-                    for fact in extract.facts:
-                        fact = fact.strip()
-                        if not fact:
-                            continue
-                        evidence_line = f"[{source.id}] {fact}"
-                        if is_new or evidence_line not in seen_evidence:
-                            made_progress = True
-                        seen_evidence.add(evidence_line)
-                        evidence.append(evidence_line)
+                if fact not in source_facts and len(source_facts) < FACTS_PER_SOURCE_CAP:
+                    source_facts.append(fact)
+                evidence_line = f"[{source.id}] {fact}"
+                if is_new or evidence_line not in seen_evidence:
+                    made_progress = True
+                seen_evidence.add(evidence_line)
+                evidence.append(evidence_line)
 
         if stopped_reason == "wall_clock":
             pending_evidence = evidence or ["(no new evidence)"]
@@ -580,10 +833,13 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
             no_progress_counter = 0
         if no_progress_counter >= NO_PROGRESS_LIMIT:
             stopped_reason = "no_progress"
-            pending_evidence = evidence or ["(no new evidence)"]
+            pending_evidence = evidence or pending_evidence
             break
 
-        pending_evidence = evidence or ["(no new evidence)"]
+        # A skipped (failed-reasoner) round never compressed the pending
+        # evidence, so keep it visible for the retry round.
+        if not reasoner_failed:
+            pending_evidence = evidence or ["(no new evidence)"]
 
         if budget.expired():
             stopped_reason = "wall_clock"
@@ -595,6 +851,7 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
         question=question,
         report=_final_workspace(report, pending_evidence),
         sources=sources,
+        evidence=_evidence_digest(facts_by_source),
     )
     fallback_report = _final_workspace(report, pending_evidence).strip()
     if not fallback_report:
@@ -638,11 +895,12 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
         question=question,
         report=final_report,
         sources=sources,
-        sources_considered=sources_considered,
+        sources_considered=len(considered_urls),
         sources_used=sources_used,
         confidence=confidence,
         rounds_used=rounds_used,
         stopped_reason=stopped_reason,
         elapsed_seconds=elapsed,
         warnings=warnings,
+        stats=stats,
     )

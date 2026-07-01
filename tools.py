@@ -418,6 +418,7 @@ class DeepResearchTools(Toolkit):
             stopped_reason=result.stopped_reason,
             elapsed_seconds=result.elapsed_seconds,
             warnings=result.warnings,
+            stats=result.stats,
         )
 
 
