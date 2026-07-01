@@ -90,6 +90,15 @@ async def test_stops_on_confidence_round_two() -> None:
     assert calls == 2
 
 
+def test_default_depth_constants_track_upstream_react_shape() -> None:
+    assert loop.MAX_ROUNDS_CAP == 100
+    assert loop.WALL_CLOCK_SECONDS_CAP == 150 * 60
+    assert loop.RESULTS_PER_QUERY == 10
+    assert loop.RESULTS_PER_QUERY_CAP == 10
+    assert loop.MAX_READS_PER_ROUND >= 10
+    assert loop.REPORT_TOKEN_CAP >= 8_000
+
+
 @pytest.mark.asyncio
 async def test_stops_on_max_rounds_without_overrun() -> None:
     calls = 0
@@ -327,6 +336,11 @@ async def test_compression_replaces_report_and_pending_evidence() -> None:
 @pytest.mark.asyncio
 async def test_citation_ids_are_stable_and_monotonic() -> None:
     calls = 0
+    urls = {
+        1: "https://example.com/a",
+        2: "https://example.com/b",
+        3: "https://example.com/a",
+    }
 
     async def reason(_prompt: str) -> Any:
         nonlocal calls
@@ -340,28 +354,20 @@ async def test_citation_ids_are_stable_and_monotonic() -> None:
                 next_action="finish",
             )
         return loop.ResearchStep(
-            thought="search",
+            thought="read",
             updated_report=f"report {calls}",
             open_questions=[],
             confidence=0.1,
-            next_action="search",
-            search_queries=[loop.SearchQuery(query=f"q{calls}")],
+            next_action="read",
+            read_urls=[urls[calls]],
         )
 
-    search_calls = 0
+    async def read(url: str) -> Any:
+        return loop.Page(url=url, title=url.rsplit("/", 1)[-1].upper(), text=f"text {url}")
 
-    async def search(_query: Any, _limit: int) -> list[Any]:
-        nonlocal search_calls
-        search_calls += 1
-        if search_calls == 1:
-            return []
-        urls = {
-            2: "https://example.com/a",
-            3: "https://example.com/b",
-            4: "https://example.com/a",
-        }
-        url = urls[search_calls]
-        return [{"url": url, "title": url.rsplit("/", 1)[-1].upper(), "snippet": "s"}]
+    async def extract(prompt: str) -> Any:
+        fact = "fact A" if "https://example.com/a" in prompt else "fact B"
+        return loop.Extraction(facts=[fact], relevant=True)
 
     async def synthesize(_prompt: str) -> str:
         return "Use A [1] and B [2]"
@@ -371,9 +377,9 @@ async def test_citation_ids_are_stable_and_monotonic() -> None:
         max_rounds=6,
         wall_clock_seconds=60,
         reason_fn=reason,
-        extract_fn=_unused_extract,
-        search_fn=search,
-        read_fn=_unused_read,
+        extract_fn=extract,
+        search_fn=_empty_search,
+        read_fn=read,
         synthesize_fn=synthesize,
     )
 
@@ -412,7 +418,38 @@ async def test_reasoner_prompt_exposes_candidate_urls() -> None:
     )
 
     assert "https://example.com/source" in prompts[0]
-    assert "[1] Source - https://example.com/source" in prompts[0]
+    assert "Candidate URL: Source - https://example.com/source" in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_search_hits_are_candidates_not_citeable_sources_until_read() -> None:
+    async def search(_query: Any, _limit: int) -> list[Any]:
+        return [{"url": "https://example.com/a", "title": "A", "snippet": "seed"}]
+
+    async def reason(_prompt: str) -> Any:
+        return loop.ResearchStep(
+            thought="finish from candidate only",
+            updated_report="candidate-only claim [1]",
+            open_questions=[],
+            confidence=0.2,
+            next_action="finish",
+        )
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=1,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=search,
+        read_fn=_unused_read,
+        synthesize_fn=lambda _prompt: _await("candidate-only claim [1]"),
+    )
+
+    assert result.sources == []
+    assert result.sources_considered == 1
+    assert "[1]" not in result.report
+    assert result.report.endswith("## Sources\n(none)")
 
 
 @pytest.mark.asyncio
@@ -600,46 +637,58 @@ async def test_round_search_failures_warn_and_continue_to_synthesis() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sources_used_ignores_generated_sources_section() -> None:
+async def test_final_synthesis_without_valid_citations_retries_with_registry() -> None:
     async def search(_query: Any, _limit: int) -> list[Any]:
-        return [{"url": "https://example.com/a", "title": "A", "snippet": "seed"}]
+        return []
 
     async def reason(_prompt: str) -> Any:
         return loop.ResearchStep(
-            thought="finish",
-            updated_report="body without citations",
+            thought="read",
+            updated_report="need page",
             open_questions=[],
-            confidence=0.2,
-            next_action="finish",
+            confidence=0.1,
+            next_action="read",
+            read_urls=["https://example.com/a"],
         )
+
+    synthesize_calls = 0
+
+    async def synthesize(_prompt: str) -> str:
+        nonlocal synthesize_calls
+        synthesize_calls += 1
+        if synthesize_calls == 1:
+            return "body without citations"
+        return "body with citation [1]"
 
     result = await loop.run_research_loop(
         question="q",
         max_rounds=1,
         wall_clock_seconds=60,
         reason_fn=reason,
-        extract_fn=_unused_extract,
+        extract_fn=lambda _prompt: _await(loop.Extraction(facts=["verified fact"], relevant=True)),
         search_fn=search,
-        read_fn=_unused_read,
-        synthesize_fn=lambda _prompt: _await("body without citations"),
+        read_fn=lambda url: _await(loop.Page(url=url, title="A", text="verified text")),
+        synthesize_fn=synthesize,
     )
 
-    assert result.sources_used == 0
-    assert result.report.endswith("## Sources\n(none)")
+    assert synthesize_calls == 2
+    assert result.sources_used == 1
+    assert result.report.endswith("## Sources\n[1] A - https://example.com/a")
 
 
 @pytest.mark.asyncio
 async def test_final_sources_section_is_rebuilt_from_registry() -> None:
     async def search(_query: Any, _limit: int) -> list[Any]:
-        return [{"url": "https://example.com/a", "title": "A", "snippet": "seed"}]
+        return []
 
     async def reason(_prompt: str) -> Any:
         return loop.ResearchStep(
-            thought="finish",
+            thought="read",
             updated_report="partial [1]",
             open_questions=[],
             confidence=0.2,
-            next_action="finish",
+            next_action="read",
+            read_urls=["https://example.com/a"],
         )
 
     async def synthesize(_prompt: str) -> str:
@@ -655,9 +704,9 @@ async def test_final_sources_section_is_rebuilt_from_registry() -> None:
         max_rounds=1,
         wall_clock_seconds=60,
         reason_fn=reason,
-        extract_fn=_unused_extract,
+        extract_fn=lambda _prompt: _await(loop.Extraction(facts=["fact A"], relevant=True)),
         search_fn=search,
-        read_fn=_unused_read,
+        read_fn=lambda url: _await(loop.Page(url=url, title="A", text="text")),
         synthesize_fn=synthesize,
     )
 
@@ -673,15 +722,16 @@ async def test_final_sources_section_is_rebuilt_from_registry() -> None:
 @pytest.mark.asyncio
 async def test_final_source_like_heading_variants_are_stripped(heading: str) -> None:
     async def search(_query: Any, _limit: int) -> list[Any]:
-        return [{"url": "https://example.com/a", "title": "A", "snippet": "seed"}]
+        return []
 
     async def reason(_prompt: str) -> Any:
         return loop.ResearchStep(
-            thought="finish",
+            thought="read",
             updated_report="partial [1]",
             open_questions=[],
             confidence=0.2,
-            next_action="finish",
+            next_action="read",
+            read_urls=["https://example.com/a"],
         )
 
     async def synthesize(_prompt: str) -> str:
@@ -692,9 +742,9 @@ async def test_final_source_like_heading_variants_are_stripped(heading: str) -> 
         max_rounds=1,
         wall_clock_seconds=60,
         reason_fn=reason,
-        extract_fn=_unused_extract,
+        extract_fn=lambda _prompt: _await(loop.Extraction(facts=["fact A"], relevant=True)),
         search_fn=search,
-        read_fn=_unused_read,
+        read_fn=lambda url: _await(loop.Page(url=url, title="A", text="text")),
         synthesize_fn=synthesize,
     )
 
@@ -705,15 +755,28 @@ async def test_final_source_like_heading_variants_are_stripped(heading: str) -> 
 @pytest.mark.asyncio
 async def test_final_synthesis_failure_returns_fallback_report_with_warning() -> None:
     async def search(_query: Any, _limit: int) -> list[Any]:
-        return [{"url": "https://example.com/a", "title": "A", "snippet": "seed"}]
+        return []
+
+    reason_calls = 0
 
     async def reason(_prompt: str) -> Any:
+        nonlocal reason_calls
+        reason_calls += 1
+        if reason_calls == 2:
+            return loop.ResearchStep(
+                thought="finish",
+                updated_report="compressed [1]",
+                open_questions=[],
+                confidence=0.2,
+                next_action="finish",
+            )
         return loop.ResearchStep(
-            thought="finish",
-            updated_report="compressed [1]",
+            thought="read",
+            updated_report="need source",
             open_questions=[],
             confidence=0.2,
-            next_action="finish",
+            next_action="read",
+            read_urls=["https://example.com/a"],
         )
 
     async def synthesize(_prompt: str) -> str:
@@ -721,12 +784,12 @@ async def test_final_synthesis_failure_returns_fallback_report_with_warning() ->
 
     result = await loop.run_research_loop(
         question="q",
-        max_rounds=1,
+        max_rounds=2,
         wall_clock_seconds=60,
         reason_fn=reason,
-        extract_fn=_unused_extract,
+        extract_fn=lambda _prompt: _await(loop.Extraction(facts=["fact A"], relevant=True)),
         search_fn=search,
-        read_fn=_unused_read,
+        read_fn=lambda url: _await(loop.Page(url=url, title="A", text="text")),
         synthesize_fn=synthesize,
     )
 
@@ -764,7 +827,7 @@ async def test_search_and_read_routing_respect_round_clamps() -> None:
         read_fn=_unused_read,
         synthesize_fn=_synthesize,
     )
-    assert search_queries == ["q0", "q1", "q2"]
+    assert search_queries == [f"q{i}" for i in range(loop.MAX_QUERIES_PER_ROUND)]
 
     read_urls: list[str] = []
 
@@ -792,7 +855,7 @@ async def test_search_and_read_routing_respect_round_clamps() -> None:
         read_fn=read,
         synthesize_fn=_synthesize,
     )
-    assert read_urls == ["https://example.com/0", "https://example.com/1", "https://example.com/2"]
+    assert read_urls == [f"https://example.com/{i}" for i in range(loop.MAX_READS_PER_ROUND)]
 
 
 @pytest.mark.asyncio

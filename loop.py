@@ -15,15 +15,15 @@ from pydantic import BaseModel, Field, ValidationError
 from .prompts import extractor_prompt, reasoner_prompt, synthesize_prompt
 
 CONFIDENCE_STOP = 0.8
-MAX_ROUNDS_CAP = 40
-WALL_CLOCK_SECONDS_CAP = 900
-MAX_QUERIES_PER_ROUND = 3
-MAX_QUERIES_PER_ROUND_CAP = 5
-RESULTS_PER_QUERY = 5
+MAX_ROUNDS_CAP = 100
+WALL_CLOCK_SECONDS_CAP = 150 * 60
+MAX_QUERIES_PER_ROUND = 5
+MAX_QUERIES_PER_ROUND_CAP = 10
+RESULTS_PER_QUERY = 10
 RESULTS_PER_QUERY_CAP = 10
-MAX_READS_PER_ROUND = 3
-MAX_READS_PER_ROUND_CAP = 5
-REPORT_TOKEN_CAP = 2000
+MAX_READS_PER_ROUND = 10
+MAX_READS_PER_ROUND_CAP = 20
+REPORT_TOKEN_CAP = 8_000
 REPORT_CHAR_CAP = REPORT_TOKEN_CAP * 4
 NO_PROGRESS_LIMIT = 2
 
@@ -334,12 +334,36 @@ def _evidence_line(source: SourceRecord, text: str) -> str:
     return f"[{source.id}] {source.title} - {source.url}"
 
 
+def _candidate_line(hit: SearchHit) -> str:
+    title = hit.title.strip() or hit.url
+    snippet = hit.snippet.strip()
+    if snippet:
+        return f"Candidate URL: {title} - {hit.url}: {snippet}"
+    return f"Candidate URL: {title} - {hit.url}"
+
+
 def _final_workspace(report: str, pending_evidence: Sequence[str]) -> str:
     useful_evidence = [item for item in pending_evidence if item != "(no new evidence)"]
     if not useful_evidence:
         return report
     evidence_text = "\n".join(f"- {item}" for item in useful_evidence)
     return f"{report.rstrip()}\n\nUnsynthesized evidence from the final round:\n{evidence_text}".strip()
+
+
+def _has_valid_citations(report: str, sources_by_url: dict[str, SourceRecord]) -> bool:
+    return _cited_source_count(report, sources_by_url) > 0
+
+
+def _needs_citation_retry(report: str, sources_by_url: dict[str, SourceRecord]) -> bool:
+    return bool(sources_by_url) and not _has_valid_citations(report, sources_by_url)
+
+
+def _citation_retry_prompt(prompt: str) -> str:
+    return (
+        f"{prompt}\n\nYour previous final answer used no valid source citations. "
+        "Rewrite the final answer using at least one valid inline [n] citation from the source registry. "
+        "Do not cite candidate URLs or unverified search snippets."
+    )
 
 
 def _wall_clock_warning(label: str) -> str:
@@ -404,13 +428,7 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     pending_evidence: list[str] = []
     for hit in seed_hits[:results_per_query]:
         sources_considered += 1
-        source, _ = _register_source(
-            sources_by_url,
-            url=hit.url,
-            title=hit.title,
-            snippet=hit.snippet,
-        )
-        evidence_line = _evidence_line(source, hit.snippet.strip() or source.snippet)
+        evidence_line = _candidate_line(hit)
         seen_evidence.add(evidence_line)
         pending_evidence.append(evidence_line)
     if not pending_evidence:
@@ -506,14 +524,8 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
                     continue
                 for hit in hits[:results_per_query]:
                     sources_considered += 1
-                    source, is_new = _register_source(
-                        sources_by_url,
-                        url=hit.url,
-                        title=hit.title,
-                        snippet=hit.snippet,
-                    )
-                    evidence_line = _evidence_line(source, hit.snippet.strip() or source.snippet)
-                    if is_new or evidence_line not in seen_evidence:
+                    evidence_line = _candidate_line(hit)
+                    if evidence_line not in seen_evidence:
                         made_progress = True
                     seen_evidence.add(evidence_line)
                     evidence.append(evidence_line)
@@ -593,6 +605,25 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
             sources,
             sources_by_url,
         )
+        if _needs_citation_retry(final_report, sources_by_url):
+            retried_report = _ensure_sources_section(
+                await budget.wait_for(
+                    "final synthesis citation retry",
+                    lambda: synthesize_fn(_citation_retry_prompt(final_prompt)),
+                ),
+                sources,
+                sources_by_url,
+            )
+            if _has_valid_citations(retried_report, sources_by_url):
+                final_report = retried_report
+            else:
+                warnings.append("final synthesis produced no valid citations after retry")
+                fallback_with_sources = _ensure_sources_section(fallback_report, sources, sources_by_url)
+                final_report = (
+                    fallback_with_sources
+                    if _has_valid_citations(fallback_with_sources, sources_by_url)
+                    else retried_report
+                )
     except _WallClockExpired as exc:
         stopped_reason = "wall_clock"
         warnings.append(_wall_clock_warning(exc.label))

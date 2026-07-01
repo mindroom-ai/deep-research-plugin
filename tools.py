@@ -28,6 +28,13 @@ from mindroom.tool_system.runtime_context import (
 
 from .loop import (
     MAX_ROUNDS_CAP,
+    MAX_QUERIES_PER_ROUND,
+    MAX_QUERIES_PER_ROUND_CAP,
+    MAX_READS_PER_ROUND,
+    MAX_READS_PER_ROUND_CAP,
+    REPORT_TOKEN_CAP,
+    RESULTS_PER_QUERY,
+    RESULTS_PER_QUERY_CAP,
     WALL_CLOCK_SECONDS_CAP,
     Extraction,
     Page,
@@ -40,9 +47,17 @@ from .loop import (
 
 LOGGER = get_logger(__name__)
 TOOL_NAME = "deep_research"
-DEFAULT_MAX_ROUNDS = 10
-DEFAULT_WALL_CLOCK_SECONDS = 300
-MAX_PAGE_CHARS = 60_000
+DEFAULT_MAX_ROUNDS = MAX_ROUNDS_CAP
+DEFAULT_WALL_CLOCK_SECONDS = WALL_CLOCK_SECONDS_CAP
+DEFAULT_MAX_QUERIES_PER_ROUND = MAX_QUERIES_PER_ROUND
+DEFAULT_RESULTS_PER_QUERY = RESULTS_PER_QUERY
+DEFAULT_MAX_READS_PER_ROUND = MAX_READS_PER_ROUND
+DEFAULT_PAGE_CHAR_LIMIT = 150_000
+DEFAULT_REPORT_TOKEN_CAP = REPORT_TOKEN_CAP
+MIN_PAGE_CHAR_LIMIT = 10_000
+MAX_PAGE_CHAR_LIMIT = 600_000
+MIN_REPORT_TOKEN_CAP = 2_000
+MAX_REPORT_TOKEN_CAP = 64_000
 PROGRESS_EMIT_TIMEOUT_SECONDS = 2.0
 
 
@@ -226,6 +241,11 @@ class DeepResearchTools(Toolkit):
         wall_clock_seconds: int = DEFAULT_WALL_CLOCK_SECONDS,
         model: str | None = None,
         verbosity: str = "progress",
+        max_queries_per_round: int = DEFAULT_MAX_QUERIES_PER_ROUND,
+        results_per_query: int = DEFAULT_RESULTS_PER_QUERY,
+        max_reads_per_round: int = DEFAULT_MAX_READS_PER_ROUND,
+        page_char_limit: int = DEFAULT_PAGE_CHAR_LIMIT,
+        report_token_cap: int = DEFAULT_REPORT_TOKEN_CAP,
     ) -> str:
         """Run a bounded deep research loop for one question."""
         normalized_question = question.strip() if isinstance(question, str) else ""
@@ -239,6 +259,23 @@ class DeepResearchTools(Toolkit):
         try:
             max_rounds = clamp_int(max_rounds, minimum=1, maximum=MAX_ROUNDS_CAP)
             wall_clock_seconds = clamp_int(wall_clock_seconds, minimum=60, maximum=WALL_CLOCK_SECONDS_CAP)
+            max_queries_per_round = clamp_int(
+                max_queries_per_round,
+                minimum=1,
+                maximum=MAX_QUERIES_PER_ROUND_CAP,
+            )
+            results_per_query = clamp_int(results_per_query, minimum=1, maximum=RESULTS_PER_QUERY_CAP)
+            max_reads_per_round = clamp_int(max_reads_per_round, minimum=1, maximum=MAX_READS_PER_ROUND_CAP)
+            page_char_limit = clamp_int(
+                page_char_limit,
+                minimum=MIN_PAGE_CHAR_LIMIT,
+                maximum=MAX_PAGE_CHAR_LIMIT,
+            )
+            report_token_cap = clamp_int(
+                report_token_cap,
+                minimum=MIN_REPORT_TOKEN_CAP,
+                maximum=MAX_REPORT_TOKEN_CAP,
+            )
             verbosity = (
                 verbosity
                 if isinstance(verbosity, str) and verbosity in {"silent", "progress", "verbose"}
@@ -324,7 +361,7 @@ class DeepResearchTools(Toolkit):
 
         async def read_fn(url: str) -> Page:
             title, text = _extract_text_from_website_payload(await _call_tool_function(website, "read_url", url))
-            return Page(url=url, title=title or url, text=_truncate(text, MAX_PAGE_CHARS))
+            return Page(url=url, title=title or url, text=_truncate(text, page_char_limit))
 
         async def emit_fn(event: dict[str, object]) -> None:
             if verbosity == "silent":
@@ -353,6 +390,10 @@ class DeepResearchTools(Toolkit):
                 synthesize_fn=synthesize_fn,
                 emit_fn=emit_fn,
                 budget_start=wrapper_start,
+                max_queries_per_round=max_queries_per_round,
+                results_per_query=results_per_query,
+                max_reads_per_round=max_reads_per_round,
+                report_char_cap=report_token_cap * 4,
             )
             if verbosity != "silent":
                 await _emit_message(
@@ -383,10 +424,13 @@ class DeepResearchTools(Toolkit):
 @register_tool_with_metadata(
     name=TOOL_NAME,
     display_name="Deep Research",
-    description="Run a bounded cited web-research loop using the caller's active MindRoom model.",
+    description=(
+        "Run a bounded cited web-research loop using the caller's active MindRoom model. "
+        "Requires the built-in Serper tool to be configured."
+    ),
     category=ToolCategory.RESEARCH,
-    status=ToolStatus.AVAILABLE,
-    setup_type=SetupType.NONE,
+    status=ToolStatus.REQUIRES_CONFIG,
+    setup_type=SetupType.API_KEY,
     icon="FaSearchengin",
     icon_color="text-blue-600",
 )

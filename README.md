@@ -15,7 +15,7 @@ Ask one hard question and get back a cited report. `deep_research` runs a bounde
 - Runs the loop on the caller's active MindRoom model — provider-agnostic, no model bundled
 - Reuses MindRoom's existing tools: Serper search and the native website reader
 - Rolling summarize-and-replace report keeps long runs inside the context budget
-- Stable `[n]` citations backed by a source registry that is the single source of truth
+- Stable `[n]` citations backed by a verified source registry that is the single source of truth
 - Hard wall-clock deadline bounds every step, including progress updates and final synthesis
 - Confidence-based and no-progress stopping so it ends as soon as the answer is solid
 - Streams per-round progress into the thread, or runs quietly on request
@@ -25,7 +25,7 @@ Ask one hard question and get back a cited report. `deep_research` runs a bounde
 
 1. An agent calls `deep_research(question)` in a thread.
 2. The plugin resolves the caller's active model and builds an ephemeral, tool-less reasoning agent.
-3. Each round: search the web, read the most promising pages, extract facts, and fold them into a rolling report with stable citations.
+3. Each round: search the web, read the most promising candidate pages, extract facts, and fold verified evidence into a rolling report with stable citations.
 4. Between rounds the report is compressed (summarize-and-replace) so context stays bounded.
 5. The loop stops on high confidence, on no further progress, or when the round/wall-clock budget runs out.
 6. A final synthesis pass produces the report, and the `## Sources` section is rebuilt from the registry using only citations that actually appear in the body.
@@ -34,21 +34,26 @@ Ask one hard question and get back a cited report. `deep_research` runs a bounde
 
 | Tool | Purpose |
 |------|---------|
-| `deep_research(question, max_rounds=10, wall_clock_seconds=300, model=None, verbosity="progress")` | Run a bounded, cited web-research loop for one question and return a JSON report envelope |
+| `deep_research(question, max_rounds=100, wall_clock_seconds=9000, model=None, verbosity="progress", max_queries_per_round=5, results_per_query=10, max_reads_per_round=10, page_char_limit=150000, report_token_cap=8000)` | Run a bounded, cited web-research loop for one question and return a JSON report envelope |
 
 The returned envelope includes `status`, `report` (Markdown with `[n]` citations), `sources`, `confidence`, `rounds_used`, `stopped_reason`, `elapsed_seconds`, and any `warnings`.
 
 Parameters:
 
 - `question` — the research question (required, non-empty).
-- `max_rounds` — soft round budget (default `10`, capped at `40`).
-- `wall_clock_seconds` — hard time budget (default `300`, min `60`, capped at `900`).
+- `max_rounds` — soft round budget (default `100`, mirroring the original repository's default LLM-call budget as this loop's round cap).
+- `wall_clock_seconds` — hard time budget (default `9000`, matching the original repository's 150-minute timeout).
 - `model` — override the model name; defaults to the caller's active model.
 - `verbosity` — `"progress"` streams per-round updates into the thread; `"silent"` returns only the final report.
+- `max_queries_per_round` — maximum planned search queries per search round (default `5`, capped at `10`).
+- `results_per_query` — search results fetched per query (default `10`, capped at `10`).
+- `max_reads_per_round` — maximum URLs read in one read round (default `10`, capped at `20`).
+- `page_char_limit` — maximum page text passed to extraction (default `150000` chars, capped at `600000`).
+- `report_token_cap` — approximate rolling report token budget (default `8000`, capped at `64000`).
 
 ## Configuration
 
-`deep_research` uses whatever model the calling agent is configured with, and reuses MindRoom's Serper search and native website reader. Make sure the runtime already has a Serper API key configured for search.
+`deep_research` uses whatever model the calling agent is configured with, and reuses MindRoom's Serper search and native website reader. Make sure the built-in Serper tool has an API key configured before enabling this plugin.
 
 ## Setup
 

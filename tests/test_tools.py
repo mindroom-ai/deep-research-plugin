@@ -20,7 +20,7 @@ import pytest
 
 from mindroom.config.main import Config, load_config
 from mindroom.constants import resolve_primary_runtime_paths
-from mindroom.tool_system.metadata import get_tool_by_name as resolve_tool_by_name
+from mindroom.tool_system.metadata import SetupType, TOOL_METADATA, ToolStatus, get_tool_by_name as resolve_tool_by_name
 from mindroom.tool_system.plugins import load_plugins
 from mindroom.tool_system.registry_state import capture_tool_registry_snapshot, restore_tool_registry_snapshot
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
@@ -146,11 +146,14 @@ def test_plugin_discovery_registers_tool_and_builtin_dependencies_resolve(tmp_pa
             )
             resolve_tool_by_name("serper", runtime_paths, worker_target=None)
             resolve_tool_by_name("website", runtime_paths, worker_target=None)
+            deep_research_metadata = TOOL_METADATA["deep_research"]
     finally:
         restore_tool_registry_snapshot(snapshot)
 
     assert [plugin.name for plugin in plugins] == ["deep-research"]
     assert type(deep_research).__name__ == "DeepResearchTools"
+    assert deep_research_metadata.status is ToolStatus.REQUIRES_CONFIG
+    assert deep_research_metadata.setup_type is SetupType.API_KEY
     checked_dependency_sets = {tuple(call.args[0]) for call in ensure_deps.call_args_list}
     assert ("requests",) in checked_dependency_sets
     assert ("httpx", "beautifulsoup4") in checked_dependency_sets
@@ -447,8 +450,56 @@ async def test_arg_clamping_before_loop_call() -> None:
     ):
         await tools.deep_research("What?", max_rounds=999, wall_clock_seconds=99999)
 
-    assert captured["max_rounds"] == 40
-    assert captured["wall_clock_seconds"] == 900
+    assert captured["max_rounds"] == 100
+    assert captured["wall_clock_seconds"] == 9000
+
+
+@pytest.mark.asyncio
+async def test_depth_args_are_forwarded_to_loop_and_page_reader() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+    captured: dict[str, Any] = {}
+
+    async def fake_loop(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        page = await kwargs["read_fn"]("https://example.com")
+        assert len(page.text) == 120_000
+        return _result(module)
+
+    class LongWebsite:
+        def read_url(self, _url: str) -> str:
+            return json.dumps([{"content": "x" * 200_000, "meta_data": {"title": "Long"}}])
+
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
+        if name == "serper":
+            return _FakeSerper()
+        if name == "website":
+            return LongWebsite()
+        raise AssertionError(name)
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", side_effect=fake_loop),
+    ):
+        result = json.loads(
+            await tools.deep_research(
+                "What?",
+                max_queries_per_round=8,
+                results_per_query=10,
+                max_reads_per_round=12,
+                page_char_limit=120_000,
+                report_token_cap=12_000,
+            ),
+        )
+
+    assert result["status"] == "ok"
+    assert captured["max_queries_per_round"] == 8
+    assert captured["results_per_query"] == 10
+    assert captured["max_reads_per_round"] == 12
+    assert captured["report_char_cap"] == 48_000
 
 
 @pytest.mark.asyncio

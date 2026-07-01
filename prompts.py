@@ -40,7 +40,8 @@ Budget left:
 Return only the requested structured object. Update the report by compressing
 the current report plus any useful pending evidence into a standalone research
 workspace. Keep it concise and cite claims with existing [n] source IDs when
-available. Decide exactly one next_action:
+available. Lines beginning "Candidate URL:" are discovery leads only; do not
+cite them unless they later appear in the source registry with a [n] ID. Decide exactly one next_action:
 - search: when more search results are needed; provide up to 3 focused queries.
 - read: when specific URLs should be fetched; provide up to 3 URLs.
 - finish: when the report can answer the question.
