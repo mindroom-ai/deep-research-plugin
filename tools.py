@@ -1,0 +1,398 @@
+# ruff: noqa: INP001
+"""Agent-facing tools for the MindRoom deep-research plugin."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from collections.abc import Callable
+
+from agno.agent import Agent
+from agno.tools import Toolkit
+
+from mindroom.logging_config import get_logger
+from mindroom.model_loading import get_model_instance
+from mindroom.tool_system.metadata import (
+    SetupType,
+    ToolCategory,
+    ToolStatus,
+    get_tool_by_name,
+    register_tool_with_metadata,
+)
+from mindroom.tool_system.runtime_context import (
+    build_execution_identity_from_runtime_context,
+    get_tool_runtime_context,
+    resolve_tool_runtime_hook_bindings,
+)
+
+from .loop import (
+    MAX_ROUNDS_CAP,
+    WALL_CLOCK_SECONDS_CAP,
+    Extraction,
+    Page,
+    ResearchStep,
+    SearchHit,
+    SearchQuery,
+    clamp_int,
+    run_research_loop,
+)
+
+LOGGER = get_logger(__name__)
+TOOL_NAME = "deep_research"
+DEFAULT_MAX_ROUNDS = 10
+DEFAULT_WALL_CLOCK_SECONDS = 300
+MAX_PAGE_CHARS = 60_000
+PROGRESS_EMIT_TIMEOUT_SECONDS = 2.0
+
+
+def _payload(status: str, tool: str = TOOL_NAME, **kwargs: object) -> str:
+    payload: dict[str, object] = {"status": status, "tool": tool}
+    payload.update(kwargs)
+    return json.dumps(payload, sort_keys=True)
+
+
+def _error(message: str, *, warnings: list[str] | None = None) -> str:
+    return _payload("error", message=message, warnings=warnings or [])
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip()
+
+
+def _resolve_model_name(context: object, model: str | None) -> str:
+    if model:
+        if model not in context.config.models:
+            available = ", ".join(sorted(context.config.models))
+            msg = f"Unknown model override: {model}. Available models: {available}"
+            raise ValueError(msg)
+        return model
+    if context.active_model_name:
+        return context.active_model_name
+    resolved = context.config.resolve_runtime_model(
+        entity_name=context.agent_name,
+        room_id=context.room_id,
+        thread_id=context.resolved_thread_id,
+        runtime_paths=context.runtime_paths,
+    )
+    return resolved.model_name
+
+
+def _session_id(context: object, role: str, count: int) -> str:
+    base = context.session_id or context.correlation_id or context.resolved_thread_id or context.room_id
+    return f"deep-research:{base}:{role}:{count}"
+
+
+def _content_from_response(response: object) -> object:
+    return getattr(response, "content", response)
+
+
+def _extract_text_from_website_payload(payload: str) -> tuple[str, str]:
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return "", payload
+    if isinstance(parsed, dict):
+        error = parsed.get("error")
+        status = str(parsed.get("status") or "").lower()
+        message = parsed.get("message")
+        if error or status == "error":
+            raise RuntimeError(str(error or message or "website read failed"))
+    docs = parsed if isinstance(parsed, list) else [parsed]
+    title = ""
+    chunks: list[str] = []
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        meta = doc.get("meta_data") or doc.get("metadata") or {}
+        if isinstance(meta, dict) and not title:
+            title = str(meta.get("title") or meta.get("name") or "")
+        if not title:
+            title = str(doc.get("title") or doc.get("name") or "")
+        for key in ("content", "text", "page_content", "description"):
+            value = doc.get(key)
+            if isinstance(value, str) and value.strip():
+                chunks.append(value.strip())
+                break
+    return title, "\n\n".join(chunks)
+
+
+def _parse_search_results(raw: str) -> list[SearchHit]:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, dict) or parsed.get("error"):
+        if isinstance(parsed, dict) and parsed.get("error"):
+            raise RuntimeError(str(parsed["error"]))
+        return []
+    rows: list[object] = []
+    for key in ("organic", "news", "articles", "scholar", "results"):
+        value = parsed.get(key)
+        if isinstance(value, list):
+            rows.extend(value)
+    hits: list[SearchHit] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        url = row.get("link") or row.get("url")
+        if not isinstance(url, str) or not url:
+            continue
+        title = str(row.get("title") or row.get("name") or url)
+        snippet = str(row.get("snippet") or row.get("description") or row.get("summary") or "")
+        hits.append(SearchHit(url=url, title=title, snippet=snippet))
+    return hits
+
+
+def _tool_function_entrypoint(toolkit: object, function_name: str) -> Callable[..., object]:
+    functions = getattr(toolkit, "functions", {})
+    if isinstance(functions, dict):
+        function = functions.get(function_name)
+        entrypoint = getattr(function, "entrypoint", None)
+        if callable(entrypoint):
+            return entrypoint
+    fallback = getattr(toolkit, function_name, None)
+    if callable(fallback):
+        return fallback
+    msg = f"Tool function is unavailable: {function_name}"
+    raise RuntimeError(msg)
+
+
+async def _call_tool_function(toolkit: object, function_name: str, *args: object, **kwargs: object) -> str:
+    raw = await asyncio.to_thread(_tool_function_entrypoint(toolkit, function_name), *args, **kwargs)
+    return raw if isinstance(raw, str) else str(raw)
+
+
+async def _emit_message(context: object, text: str, *, timeout_seconds: float = PROGRESS_EMIT_TIMEOUT_SECONDS) -> None:
+    bindings = resolve_tool_runtime_hook_bindings(context)
+    if bindings.message_sender is None:
+        return
+    if timeout_seconds <= 0:
+        LOGGER.warning("deep_research_progress_emit_skipped_budget_exhausted")
+        return
+    try:
+        async with asyncio.timeout(min(PROGRESS_EMIT_TIMEOUT_SECONDS, timeout_seconds)):
+            await bindings.message_sender(
+                context.room_id,
+                text,
+                context.resolved_thread_id or context.thread_id,
+                "deep-research:progress",
+                None,
+                trigger_dispatch=False,
+            )
+    except TimeoutError:
+        LOGGER.warning("deep_research_progress_emit_timeout")
+    except Exception as exc:
+        LOGGER.warning("deep_research_progress_emit_failed", error=str(exc))
+
+
+def _format_round_progress(event: dict[str, object], *, verbose: bool) -> str:
+    thought = str(event.get("thought") or "").replace("\n", " ")
+    if len(thought) > 80:
+        thought = thought[:77].rstrip() + "..."
+    confidence = float(event.get("confidence") or 0)
+    line = f"round {event['round']}/{event['max_rounds']} · {confidence:.2f} · {thought}"
+    if not verbose:
+        return line
+    queries = event.get("search_queries")
+    urls = event.get("read_urls")
+    details: list[str] = []
+    if queries:
+        details.append(f"queries={queries}")
+    if urls:
+        details.append(f"urls={urls}")
+    return line if not details else f"{line}\n" + "\n".join(details)
+
+
+class DeepResearchTools(Toolkit):
+    """Toolkit exposing bounded web research as one MindRoom tool."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            name=TOOL_NAME,
+            instructions=(
+                "Use deep_research for bounded, cited research over the web. "
+                "It returns a JSON envelope whose report field contains the final cited Markdown answer."
+            ),
+            tools=[self.deep_research],
+        )
+
+    async def deep_research(  # noqa: C901, PLR0911, PLR0915
+        self,
+        question: str,
+        max_rounds: int = DEFAULT_MAX_ROUNDS,
+        wall_clock_seconds: int = DEFAULT_WALL_CLOCK_SECONDS,
+        model: str | None = None,
+        verbosity: str = "progress",
+    ) -> str:
+        """Run a bounded deep research loop for one question."""
+        normalized_question = question.strip() if isinstance(question, str) else ""
+        if not normalized_question:
+            return _error("question must be a non-empty string")
+
+        context = get_tool_runtime_context()
+        if context is None:
+            return _error("Deep research tool context is unavailable in this runtime path.")
+
+        try:
+            max_rounds = clamp_int(max_rounds, minimum=1, maximum=MAX_ROUNDS_CAP)
+            wall_clock_seconds = clamp_int(wall_clock_seconds, minimum=60, maximum=WALL_CLOCK_SECONDS_CAP)
+            verbosity = (
+                verbosity
+                if isinstance(verbosity, str) and verbosity in {"silent", "progress", "verbose"}
+                else "progress"
+            )
+            model_name = _resolve_model_name(context, model)
+            execution_identity = build_execution_identity_from_runtime_context(context)
+            live_model = get_model_instance(
+                context.config,
+                context.runtime_paths,
+                model_name,
+                execution_identity=execution_identity,
+            )
+        except Exception as exc:
+            LOGGER.warning("deep_research_model_resolution_failed", error=str(exc))
+            return _error(str(exc))
+
+        try:
+            serper = get_tool_by_name(
+                "serper",
+                context.runtime_paths,
+                worker_target=None,
+            )
+        except Exception as exc:
+            LOGGER.warning("deep_research_serper_unavailable", error=str(exc))
+            return _error("Serper is not configured or unavailable. Configure the Serper tool to use deep_research.")
+        if hasattr(serper, "api_key") and not getattr(serper, "api_key", None):
+            return _error("Serper is not configured. Configure the Serper API key to use deep_research.")
+
+        try:
+            website = get_tool_by_name(
+                "website",
+                context.runtime_paths,
+                worker_target=None,
+            )
+        except Exception as exc:
+            LOGGER.warning("deep_research_website_unavailable", error=str(exc))
+            return _error(f"Website reader is unavailable: {exc}")
+
+        counters = {"reason": 0, "extract": 0, "synthesize": 0}
+        wrapper_start = time.monotonic()
+
+        def remaining_wall_clock_seconds() -> float:
+            return max(0.0, wall_clock_seconds - (time.monotonic() - wrapper_start))
+
+        async def reason_fn(prompt: str) -> object:
+            counters["reason"] += 1
+            agent = Agent(
+                model=live_model,
+                output_schema=ResearchStep,
+                telemetry=False,
+                markdown=False,
+            )
+            response = await agent.arun(prompt, session_id=_session_id(context, "reason", counters["reason"]))
+            return _content_from_response(response)
+
+        async def extract_fn(prompt: str) -> object:
+            counters["extract"] += 1
+            agent = Agent(
+                model=live_model,
+                output_schema=Extraction,
+                telemetry=False,
+                markdown=False,
+            )
+            response = await agent.arun(prompt, session_id=_session_id(context, "extract", counters["extract"]))
+            return _content_from_response(response)
+
+        async def synthesize_fn(prompt: str) -> str:
+            counters["synthesize"] += 1
+            agent = Agent(model=live_model, telemetry=False, markdown=False)
+            response = await agent.arun(prompt, session_id=_session_id(context, "synthesize", counters["synthesize"]))
+            content = _content_from_response(response)
+            return content if isinstance(content, str) else str(content)
+
+        async def search_fn(query: SearchQuery, limit: int) -> list[SearchHit]:
+            search_method = {
+                "web": "search_web",
+                "news": "search_news",
+                "scholar": "search_scholar",
+            }[query.kind]
+            raw = await _call_tool_function(serper, search_method, query.query, num_results=limit)
+            return _parse_search_results(raw)
+
+        async def read_fn(url: str) -> Page:
+            title, text = _extract_text_from_website_payload(await _call_tool_function(website, "read_url", url))
+            return Page(url=url, title=title or url, text=_truncate(text, MAX_PAGE_CHARS))
+
+        async def emit_fn(event: dict[str, object]) -> None:
+            if verbosity == "silent":
+                return
+            await _emit_message(
+                context,
+                _format_round_progress(event, verbose=verbosity == "verbose"),
+                timeout_seconds=remaining_wall_clock_seconds(),
+            )
+
+        try:
+            if verbosity != "silent":
+                await _emit_message(
+                    context,
+                    f"deep_research started · {max_rounds} rounds · {model_name}",
+                    timeout_seconds=remaining_wall_clock_seconds(),
+                )
+            result = await run_research_loop(
+                question=normalized_question,
+                max_rounds=max_rounds,
+                wall_clock_seconds=wall_clock_seconds,
+                reason_fn=reason_fn,
+                extract_fn=extract_fn,
+                search_fn=search_fn,
+                read_fn=read_fn,
+                synthesize_fn=synthesize_fn,
+                emit_fn=emit_fn,
+                budget_start=wrapper_start,
+            )
+            if verbosity != "silent":
+                await _emit_message(
+                    context,
+                    f"deep_research done · {result.stopped_reason} · {result.rounds_used} rounds",
+                    timeout_seconds=remaining_wall_clock_seconds(),
+                )
+            result.elapsed_seconds = time.monotonic() - wrapper_start
+        except Exception as exc:
+            LOGGER.warning("deep_research_loop_failed", error=str(exc))
+            return _error(f"deep_research failed: {exc}")
+
+        return _payload(
+            "ok",
+            question=result.question,
+            report=result.report,
+            sources=result.sources,
+            sources_considered=result.sources_considered,
+            sources_used=result.sources_used,
+            confidence=result.confidence,
+            rounds_used=result.rounds_used,
+            stopped_reason=result.stopped_reason,
+            elapsed_seconds=result.elapsed_seconds,
+            warnings=result.warnings,
+        )
+
+
+@register_tool_with_metadata(
+    name=TOOL_NAME,
+    display_name="Deep Research",
+    description="Run a bounded cited web-research loop using the caller's active MindRoom model.",
+    category=ToolCategory.RESEARCH,
+    status=ToolStatus.AVAILABLE,
+    setup_type=SetupType.NONE,
+    icon="FaSearchengin",
+    icon_color="text-blue-600",
+)
+def deep_research_factory() -> type[DeepResearchTools]:
+    """Factory function for the deep-research toolkit."""
+    return DeepResearchTools
+
+
+__all__ = ["DeepResearchTools", "deep_research_factory"]
