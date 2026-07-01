@@ -37,6 +37,7 @@ FETCHED_URLS_PROMPT_CAP = 20
 UNVETTED_EXCERPT_CHARS = 400
 PARALLEL_RESEARCHERS_CAP = 4
 SYNTHESIS_RESERVE_SECONDS = 180
+LOOP_SYNTHESIS_RESERVE_SECONDS = 90
 RESEARCH_ANGLES = (
     "comprehensive overview: map the topic broadly and establish the key facts",
     "primary sources: official data, original documents, and concrete numbers",
@@ -99,6 +100,16 @@ class SourceRecord(BaseModel):
     snippet: str = ""
 
 
+StoppedReason = Literal[
+    "confident",
+    "model_finished",
+    "max_rounds",
+    "wall_clock",
+    "no_progress",
+    "synthesis_truncated",
+]
+
+
 class LoopResult(BaseModel):
     """Final pure-loop result before tool envelope serialization."""
 
@@ -109,7 +120,7 @@ class LoopResult(BaseModel):
     sources_used: int
     confidence: float
     rounds_used: int
-    stopped_reason: Literal["confident", "model_finished", "max_rounds", "wall_clock", "no_progress"]
+    stopped_reason: StoppedReason
     elapsed_seconds: float
     warnings: list[str]
     stats: dict[str, int] = {}
@@ -468,6 +479,12 @@ def _wall_clock_warning(label: str) -> str:
     return f"wall clock expired during {label}"
 
 
+def _search_phase_seconds(wall_clock_seconds: int) -> int:
+    """Search-phase deadline that reserves wall clock for the loop's own final synthesis."""
+    reserve = min(LOOP_SYNTHESIS_RESERVE_SECONDS, max(0, wall_clock_seconds - 60) // 2)
+    return wall_clock_seconds - reserve
+
+
 async def _finalize_report(
     *,
     final_prompt: str,
@@ -602,11 +619,15 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
         "duplicate_reads_skipped": 0,
     }
     start = clock() if budget_start is None else budget_start
-    budget = _WallClockBudget(start=start, seconds=wall_clock_seconds, clock=clock)
+    total_budget = _WallClockBudget(start=start, seconds=wall_clock_seconds, clock=clock)
+    # Search/read rounds run against a shorter deadline so final synthesis
+    # always keeps a reserved slice of the wall clock instead of starting
+    # with whatever the last round happened to leave over.
+    budget = _WallClockBudget(start=start, seconds=_search_phase_seconds(wall_clock_seconds), clock=clock)
     report = ""
     confidence = 0.0
     rounds_used = 0
-    stopped_reason: Literal["confident", "model_finished", "max_rounds", "wall_clock", "no_progress"] = "max_rounds"
+    stopped_reason: StoppedReason = "max_rounds"
     sources_by_url: dict[str, SourceRecord] = {}
     facts_by_source: dict[int, list[str]] = {}
     considered_urls: set[str] = set()
@@ -681,7 +702,7 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
             report=report,
             pending_evidence=pending_evidence,
             sources=_source_lines(sources_by_url),
-            budget_left=f"{max_rounds - rounds_used} rounds; {wall_clock_seconds - int(clock() - start)} seconds",
+            budget_left=f"{max_rounds - rounds_used} rounds; {max(0, int(budget.remaining()))} seconds",
             max_queries=max_queries_per_round,
             max_reads=max_reads_per_round,
             recent_queries=executed_queries[-RECENT_QUERIES_PROMPT_CAP:],
@@ -933,12 +954,12 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
         sources=sources,
         sources_by_url=sources_by_url,
         synthesize_fn=synthesize_fn,
-        budget=budget,
+        budget=total_budget,
         warnings=warnings,
     )
     if synthesis_expired:
-        stopped_reason = "wall_clock"
-    elapsed = budget.elapsed()
+        stopped_reason = "synthesis_truncated"
+    elapsed = total_budget.elapsed()
     sources_used = _cited_source_count(final_report, sources_by_url)
 
     return LoopResult(
@@ -1005,12 +1026,19 @@ def _researcher_wall_clock(wall_clock_seconds: int) -> int:
     return max(60, wall_clock_seconds - reserve)
 
 
-_STOP_REASON_PRIORITY: tuple[str, ...] = ("confident", "model_finished", "no_progress", "max_rounds", "wall_clock")
+_STOP_REASON_PRIORITY: tuple[str, ...] = (
+    "confident",
+    "model_finished",
+    "no_progress",
+    "max_rounds",
+    "wall_clock",
+    "synthesis_truncated",
+)
 
 
 def _combined_stopped_reason(
     results: Sequence[LoopResult],
-) -> Literal["confident", "model_finished", "max_rounds", "wall_clock", "no_progress"]:
+) -> StoppedReason:
     reasons = {result.stopped_reason for result in results}
     for reason in _STOP_REASON_PRIORITY:
         if reason in reasons:
@@ -1142,7 +1170,7 @@ async def run_heavy_research_loop(
         sources_used=_cited_source_count(final_report, merged_sources_by_url),
         confidence=max(result.confidence for result in results),
         rounds_used=sum(result.rounds_used for result in results),
-        stopped_reason="wall_clock" if synthesis_expired else _combined_stopped_reason(results),
+        stopped_reason="synthesis_truncated" if synthesis_expired else _combined_stopped_reason(results),
         elapsed_seconds=budget.elapsed(),
         warnings=warnings,
         stats=stats,

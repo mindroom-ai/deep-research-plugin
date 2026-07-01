@@ -20,6 +20,7 @@ Ask one hard question and get back a cited report. `deep_research` runs a bounde
 - Append-only per-source fact bank, so extracted facts survive compression and feed final synthesis
 - Stable `[n]` citations backed by a verified source registry that is the single source of truth
 - Hard wall-clock deadline bounds every step, plus per-operation timeouts and transparent retries for search/read
+- Final synthesis gets its own reserved slice of the wall clock (search rounds stop early to leave it), and `stopped_reason: "synthesis_truncated"` flags the rare case where the report itself was cut short
 - Searches and page reads run concurrently within a round (bounded concurrency)
 - Duplicate queries and already-fetched URLs are skipped across rounds, and the reasoner is told what was already tried
 - Confidence-based stopping is evidence-gated (requires at least one registered source), plus no-progress stopping
@@ -42,7 +43,7 @@ Ask one hard question and get back a cited report. `deep_research` runs a bounde
 |------|---------|
 | `deep_research(question, max_rounds=100, wall_clock_seconds=9000, model=None, verbosity="progress", max_queries_per_round=5, results_per_query=10, max_reads_per_round=10, page_char_limit=150000, report_token_cap=16000, parallel_researchers=1, extract_model=None)` | Run a bounded, cited web-research loop for one question and return a JSON report envelope |
 
-The returned envelope includes `status`, `report` (Markdown with `[n]` citations), `sources`, `confidence`, `rounds_used`, `stopped_reason`, `elapsed_seconds`, any `warnings`, and `stats` (counts of searches, reads, extractions, retries skipped as duplicates, and failures).
+The returned envelope includes `status`, `report` (Markdown with `[n]` citations), `sources`, `confidence`, `rounds_used`, `stopped_reason`, `elapsed_seconds`, any `warnings`, and `stats` (counts of searches, reads, extractions, retries skipped as duplicates, and failures). `stopped_reason` is one of `confident`, `model_finished`, `no_progress`, `max_rounds`, `wall_clock`, or `synthesis_truncated` — only the last one means the final report itself was cut short; every other reason still ends with a fully synthesized report.
 
 Parameters:
 

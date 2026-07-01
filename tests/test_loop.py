@@ -192,7 +192,9 @@ async def test_stops_on_wall_clock_before_reasoner_call() -> None:
         clock=_expired_after_start_clock(),
     )
 
-    assert result.stopped_reason == "wall_clock"
+    # The whole budget was gone before synthesis could run, so the fallback
+    # report is flagged as truncated rather than as an ordinary time stop.
+    assert result.stopped_reason == "synthesis_truncated"
     assert result.rounds_used == 0
     assert reason_calls == 0
 
@@ -273,7 +275,8 @@ async def test_wall_clock_deadline_wraps_awaited_operations(
         clock=_almost_expired_clock(),
     )
 
-    assert result.stopped_reason == "wall_clock"
+    expected_reason = "synthesis_truncated" if blocked_operation == "final_synthesis" else "wall_clock"
+    assert result.stopped_reason == expected_reason
     assert any(warning_fragment in warning for warning in result.warnings)
 
 
@@ -1651,6 +1654,75 @@ def test_researcher_wall_clock_scales_synthesis_reserve() -> None:
     assert loop._researcher_wall_clock(9000) == 9000 - loop.SYNTHESIS_RESERVE_SECONDS
     assert loop._researcher_wall_clock(240) == 150  # reserve shrinks to 90
     assert loop._researcher_wall_clock(60) == 60  # tiny budgets keep researchers viable
+
+
+def test_combined_stopped_reason_ranks_synthesis_truncated_last() -> None:
+    def make(reason: str) -> Any:
+        return loop.LoopResult(
+            question="q",
+            report="r",
+            sources=[],
+            sources_considered=0,
+            sources_used=0,
+            confidence=0.0,
+            rounds_used=0,
+            stopped_reason=reason,
+            elapsed_seconds=0.0,
+            warnings=[],
+        )
+
+    # A researcher whose own synthesis was truncated still feeds the heavy
+    # top-level synthesis, so a more informative reason wins the summary.
+    assert loop._combined_stopped_reason([make("synthesis_truncated"), make("confident")]) == "confident"
+    assert loop._combined_stopped_reason([make("synthesis_truncated"), make("wall_clock")]) == "wall_clock"
+    assert loop._combined_stopped_reason([make("synthesis_truncated")]) == "synthesis_truncated"
+
+
+def test_search_phase_seconds_scales_synthesis_reserve() -> None:
+    assert loop._search_phase_seconds(9000) == 9000 - loop.LOOP_SYNTHESIS_RESERVE_SECONDS
+    assert loop._search_phase_seconds(240) == 150  # full 90-second reserve
+    assert loop._search_phase_seconds(100) == 80  # reserve shrinks with the budget
+    assert loop._search_phase_seconds(60) == 60  # tiny budgets keep the search phase viable
+
+
+@pytest.mark.asyncio
+async def test_search_phase_deadline_leaves_reserve_for_final_synthesis() -> None:
+    synthesize_calls = 0
+
+    async def reason(_prompt: str) -> Any:
+        raise AssertionError("reasoner should not run past the search-phase deadline")
+
+    async def synthesize(_prompt: str) -> str:
+        nonlocal synthesize_calls
+        synthesize_calls += 1
+        return "final report"
+
+    calls = 0
+
+    def clock() -> float:
+        # Past the 150-second search deadline but inside the 240-second wall clock.
+        nonlocal calls
+        calls += 1
+        return 0.0 if calls == 1 else 160.0
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=10,
+        wall_clock_seconds=240,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=_empty_search,
+        read_fn=_unused_read,
+        synthesize_fn=synthesize,
+        clock=clock,
+    )
+
+    # The search phase hit its shorter deadline, but synthesis still ran
+    # inside the reserved slice instead of falling back.
+    assert result.stopped_reason == "wall_clock"
+    assert synthesize_calls == 1
+    assert result.report.startswith("final report")
+    assert any("wall clock expired during seed search" in warning for warning in result.warnings)
 
 
 @pytest.mark.asyncio
