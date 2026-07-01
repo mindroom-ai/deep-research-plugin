@@ -215,11 +215,11 @@ def truncate_report(text: str, max_chars: int = REPORT_CHAR_CAP) -> str:
     """Truncate the rolling report to its budget, preferring a paragraph boundary."""
     if len(text) <= max_chars:
         return text
-    cut = text[: max_chars - 28]
+    cut = text[: max(0, max_chars - 28)]
     boundary = cut.rfind("\n\n")
     if boundary > max_chars // 2:
         cut = cut[:boundary]
-    return cut.rstrip() + "\n\n[truncated to budget]"
+    return (cut.rstrip() + "\n\n[truncated to budget]").strip()
 
 
 _THINK_BLOCK_RE = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.IGNORECASE | re.DOTALL)
@@ -234,7 +234,11 @@ def _json_candidates(text: str) -> list[str]:
     end = cleaned.rfind("}")
     if start >= 0 and end > start:
         candidates.append(cleaned[start : end + 1])
-    return [candidate for candidate in candidates if candidate]
+    deduped: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
 
 
 def _validate_structured(value: object, schema: type[StructuredT]) -> StructuredT:
@@ -466,7 +470,7 @@ def _wall_clock_warning(label: str) -> str:
     return f"wall clock expired during {label}"
 
 
-async def _run_worker_batch(
+async def _run_worker_batch(  # noqa: C901
     workers: Sequence[tuple[list[str], Awaitable[None]]],
     *,
     budget: _WallClockBudget,
@@ -496,6 +500,9 @@ async def _run_worker_batch(
     for task, (phase, _) in zip(tasks, workers, strict=True):
         if task in pending:
             warnings.append(_wall_clock_warning(phase[0]))
+            continue
+        if task.cancelled():
+            warnings.append(f"{phase[0]} was cancelled")
             continue
         exc = task.exception()
         if isinstance(exc, _WallClockExpired):
@@ -541,8 +548,10 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     warnings: list[str] = []
     stats = {
         "searches": 0,
+        "search_attempts": 0,
         "search_failures": 0,
         "reads": 0,
+        "read_attempts": 0,
         "read_failures": 0,
         "extractions": 0,
         "duplicate_queries_skipped": 0,
@@ -570,9 +579,14 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
 
     async def _search_once(query: SearchQuery, label: str) -> list[SearchHit]:
         stats["searches"] += 1
+
+        async def attempt() -> Sequence[SearchHit | dict[str, object]]:
+            stats["search_attempts"] += 1
+            return await search_fn(query, results_per_query)
+
         raw = await _attempt_with_retries(
             label,
-            lambda: search_fn(query, results_per_query),
+            attempt,
             budget=budget,
             op_timeout_seconds=op_timeout_seconds,
             backoff_seconds=retry_backoff_seconds,
@@ -733,11 +747,16 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
 
         async def read_worker(index: int, url: str, phase: list[str]) -> None:
             stats["reads"] += 1
+
+            async def attempt() -> Page | dict[str, object] | str:
+                stats["read_attempts"] += 1
+                return await read_fn(url)
+
             try:
                 page = _coerce_page(
                     await _attempt_with_retries(
                         phase[0],
-                        lambda: read_fn(url),
+                        attempt,
                         budget=budget,
                         op_timeout_seconds=op_timeout_seconds,
                         backoff_seconds=retry_backoff_seconds,
@@ -774,6 +793,9 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
             )
             read_results[index] = (url, page, extraction)
 
+        # Each worker carries a single-element mutable phase label that it
+        # updates as it advances (read -> extractor), so batch-expiry warnings
+        # name the sub-operation that was actually in flight.
         workers: list[tuple[list[str], Awaitable[None]]] = []
         for index, query in enumerate(planned_queries):
             phase = [f"search for {query.query}"]
