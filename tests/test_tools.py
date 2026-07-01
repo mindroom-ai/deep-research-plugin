@@ -124,6 +124,7 @@ def _result(module: ModuleType, *, rounds_used: int = 1) -> Any:
         stopped_reason="confident",
         elapsed_seconds=1.5,
         warnings=[],
+        stats={"searches": 3, "reads": 1},
     )
 
 
@@ -205,6 +206,7 @@ async def test_happy_path_payload_is_valid_sorted_json() -> None:
         "stopped_reason",
         "elapsed_seconds",
         "warnings",
+        "stats",
     ):
         assert key in result
 
