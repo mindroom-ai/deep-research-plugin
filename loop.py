@@ -826,7 +826,10 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
             def snippet_fallback() -> None:
                 # A blocked or failing page (e.g. a 403 anti-bot response)
                 # degrades to its search snippet instead of vanishing from
-                # the evidence pool; the fact is labeled unvetted.
+                # the evidence pool; the fact is labeled unvetted. Writing
+                # into this worker's own read_results slot keeps the fallback
+                # on the same merge path as a successful read — if the batch
+                # structure ever changes, this write must move with it.
                 _, snippet = candidate_meta.get(url, ("", ""))
                 snippet = snippet.strip()
                 if not snippet:
@@ -1053,6 +1056,10 @@ class _SharedCallCache(Generic[AwaitedT]):
     means each page is fetched and extracted at most once across the fleet.
     Failed or cancelled calls are not cached: the next caller re-issues them,
     which keeps the per-researcher retry semantics intact.
+
+    A cache instance lives for exactly one heavy run and never evicts; its
+    size is bounded by that run's read/extraction budget. Do not reuse an
+    instance across runs.
     """
 
     def __init__(self, fn: Callable[[str], Awaitable[AwaitedT]]) -> None:
