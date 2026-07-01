@@ -302,6 +302,66 @@ async def test_unknown_model_override_returns_error_envelope() -> None:
 
 
 @pytest.mark.asyncio
+async def test_extract_model_routes_to_separate_model_instance() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", side_effect=[object(), object()]) as get_model,
+        patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
+        patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
+    ):
+        result = json.loads(await tools.deep_research("What?", extract_model="override"))
+
+    assert result["status"] == "ok"
+    assert [call.args[2] for call in get_model.call_args_list] == ["active", "override"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_extract_model_returns_error_envelope() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "run_research_loop", AsyncMock()) as loop_mock,
+    ):
+        result = json.loads(await tools.deep_research("What?", extract_model="bogus"))
+
+    assert result["status"] == "error"
+    assert "Unknown model override: bogus" in result["message"]
+    loop_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_parallel_researchers_dispatches_heavy_mode() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
+        patch.object(module, "run_research_loop", AsyncMock()) as single_mock,
+        patch.object(module, "run_heavy_research_loop", AsyncMock(return_value=_result(module))) as heavy_mock,
+    ):
+        result = json.loads(await tools.deep_research("What?", parallel_researchers=3))
+
+    assert result["status"] == "ok"
+    single_mock.assert_not_called()
+    assert heavy_mock.call_args.kwargs["researchers"] == 3
+
+
+def test_round_progress_includes_researcher_prefix_in_heavy_mode() -> None:
+    module = _load_tools_module()
+    event = {"round": 2, "max_rounds": 9, "thought": "t", "confidence": 0.3, "researcher": 2}
+    assert module._format_round_progress(event, verbose=False).startswith("researcher 2 · round 2/9")
+
+
+@pytest.mark.asyncio
 async def test_verbosity_silent_sends_no_progress_messages() -> None:
     module = _load_tools_module()
     tools = module.DeepResearchTools()

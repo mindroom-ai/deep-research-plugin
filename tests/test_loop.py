@@ -308,7 +308,7 @@ async def test_no_progress_stops_after_duplicate_url_rounds() -> None:
     )
 
     assert result.stopped_reason == "no_progress"
-    assert result.rounds_used == 2
+    assert result.rounds_used == loop.NO_PROGRESS_LIMIT
 
 
 @pytest.mark.asyncio
@@ -973,9 +973,9 @@ async def test_structured_output_string_parse_and_malformed_retry_fallback() -> 
 
     # A failed reasoner round is skipped (not treated as finish); persistent
     # failures drain the no-progress budget instead of ending the run early.
-    assert calls == 4
+    assert calls == 2 * loop.NO_PROGRESS_LIMIT
     assert fallback_result.stopped_reason == "no_progress"
-    assert fallback_result.rounds_used == 2
+    assert fallback_result.rounds_used == loop.NO_PROGRESS_LIMIT
     assert "reasoner structured output failed after retry" in fallback_result.warnings[0]
 
 
@@ -1532,6 +1532,189 @@ async def test_stats_are_reported_in_loop_result() -> None:
     assert result.stats["reads"] == 0
     assert result.stats["read_attempts"] == 0
     assert result.stats["search_failures"] == 0
+
+
+def test_remap_citation_ids_maps_and_drops() -> None:
+    remapped = loop._remap_citation_ids("x [1] y [2, 3] z [9]", {1: 5, 3: 7})
+    assert remapped == "x [5] y [7] z "
+
+
+@pytest.mark.asyncio
+async def test_heavy_mode_merges_sources_and_remaps_citations() -> None:
+    counts = {"a": 0, "b": 0}
+    synthesize_prompts: list[str] = []
+
+    async def reason(prompt: str) -> Any:
+        key = "b" if "primary sources" in prompt else "a"
+        counts[key] += 1
+        if counts[key] == 1:
+            return loop.ResearchStep(
+                thought=f"read {key}",
+                updated_report=f"R-{key}",
+                open_questions=[],
+                confidence=0.1,
+                next_action="read",
+                read_urls=[f"https://example.com/{key}"],
+            )
+        return loop.ResearchStep(
+            thought="finish",
+            updated_report=f"{key} claim [1]",
+            open_questions=[],
+            confidence=0.5,
+            next_action="finish",
+        )
+
+    async def read(url: str) -> Any:
+        return loop.Page(url=url, title=url.rsplit("/", 1)[-1].upper(), text=f"text {url}")
+
+    async def extract(prompt: str) -> Any:
+        key = "a" if "example.com/a" in prompt else "b"
+        return loop.Extraction(facts=[f"fact {key}"], relevant=True)
+
+    async def synthesize(prompt: str) -> str:
+        synthesize_prompts.append(prompt)
+        if "Researcher 1 report" in prompt:
+            return "integrated [1] and [2]"
+        return "single finding [1]"
+
+    result = await loop.run_heavy_research_loop(
+        question="q",
+        researchers=2,
+        max_rounds=3,
+        wall_clock_seconds=600,
+        reason_fn=reason,
+        extract_fn=extract,
+        search_fn=_empty_search,
+        read_fn=read,
+        synthesize_fn=synthesize,
+    )
+
+    # Sources merged into one registry with stable global ids.
+    assert [source["url"] for source in result.sources] == [
+        "https://example.com/a",
+        "https://example.com/b",
+    ]
+    # Researcher 2's local [1] was remapped to global [2] in the heavy prompt.
+    heavy_prompt = synthesize_prompts[-1]
+    assert "Researcher 1 report\nsingle finding [1]" in heavy_prompt
+    assert "Researcher 2 report\nsingle finding [2]" in heavy_prompt
+    assert result.report.startswith("integrated [1] and [2]")
+    assert result.sources_used == 2
+    assert result.rounds_used == 4
+    assert result.stats["reads"] == 2
+    assert result.stopped_reason == "model_finished"
+
+
+@pytest.mark.asyncio
+async def test_heavy_mode_researcher_failure_degrades_and_keeps_attribution() -> None:
+    synthesize_prompts: list[str] = []
+
+    async def reason(_prompt: str) -> Any:
+        return loop.ResearchStep(
+            thought="finish",
+            updated_report="r",
+            open_questions=[],
+            confidence=0.1,
+            next_action="finish",
+        )
+
+    async def emit(event: dict[str, Any]) -> None:
+        if event.get("researcher") == 1:
+            raise RuntimeError("boom")
+
+    async def synthesize(prompt: str) -> str:
+        synthesize_prompts.append(prompt)
+        return "final report"
+
+    result = await loop.run_heavy_research_loop(
+        question="q",
+        researchers=2,
+        max_rounds=1,
+        wall_clock_seconds=600,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=_empty_search,
+        read_fn=_unused_read,
+        synthesize_fn=synthesize,
+        emit_fn=emit,
+    )
+
+    assert any("researcher 1 failed: boom" in warning for warning in result.warnings)
+    assert result.stopped_reason == "model_finished"
+    # The surviving researcher keeps its original number in the synthesis prompt.
+    heavy_prompt = synthesize_prompts[-1]
+    assert "Researcher 2 report" in heavy_prompt
+    assert "Researcher 1 report" not in heavy_prompt
+
+
+def test_researcher_wall_clock_scales_synthesis_reserve() -> None:
+    assert loop._researcher_wall_clock(9000) == 9000 - loop.SYNTHESIS_RESERVE_SECONDS
+    assert loop._researcher_wall_clock(240) == 150  # reserve shrinks to 90
+    assert loop._researcher_wall_clock(60) == 60  # tiny budgets keep researchers viable
+
+
+@pytest.mark.asyncio
+async def test_heavy_mode_single_researcher_short_circuits() -> None:
+    synthesize_prompts: list[str] = []
+
+    async def reason(_prompt: str) -> Any:
+        return loop.ResearchStep(
+            thought="finish",
+            updated_report="r",
+            open_questions=[],
+            confidence=0.1,
+            next_action="finish",
+        )
+
+    async def synthesize(prompt: str) -> str:
+        synthesize_prompts.append(prompt)
+        return "final"
+
+    result = await loop.run_heavy_research_loop(
+        question="q",
+        researchers=1,
+        max_rounds=1,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=_empty_search,
+        read_fn=_unused_read,
+        synthesize_fn=synthesize,
+    )
+
+    assert result.stopped_reason == "model_finished"
+    assert len(synthesize_prompts) == 1
+    assert "Researcher" not in synthesize_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_heavy_mode_assigns_distinct_angles_to_researchers() -> None:
+    prompts: list[str] = []
+
+    async def reason(prompt: str) -> Any:
+        prompts.append(prompt)
+        return loop.ResearchStep(
+            thought="finish",
+            updated_report="r",
+            open_questions=[],
+            confidence=0.1,
+            next_action="finish",
+        )
+
+    await loop.run_heavy_research_loop(
+        question="q",
+        researchers=2,
+        max_rounds=1,
+        wall_clock_seconds=600,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=_empty_search,
+        read_fn=_unused_read,
+        synthesize_fn=_synthesize,
+    )
+
+    assert any(loop.RESEARCH_ANGLES[0] in prompt for prompt in prompts)
+    assert any(loop.RESEARCH_ANGLES[1] in prompt for prompt in prompts)
 
 
 async def _await(value: Any) -> Any:

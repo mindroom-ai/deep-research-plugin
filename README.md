@@ -13,6 +13,8 @@ Ask one hard question and get back a cited report. `deep_research` runs a bounde
 
 - Single `deep_research(question)` tool that returns a cited Markdown report as a JSON envelope
 - Runs the loop on the caller's active MindRoom model — provider-agnostic, no model bundled
+- Heavy mode (`parallel_researchers`): up to 4 independent research loops explore the question from different angles concurrently, then one synthesis pass integrates their cited reports over a merged source registry (Tongyi DeepResearch's Research-Synthesis pattern)
+- Role-based model routing: `extract_model` sends the high-volume page-extraction role to a cheaper model while reasoning and synthesis stay on the strong one
 - Reuses MindRoom's existing tools: Serper search and the native website reader
 - Rolling summarize-and-replace report keeps long runs inside the context budget
 - Append-only per-source fact bank, so extracted facts survive compression and feed final synthesis
@@ -38,7 +40,7 @@ Ask one hard question and get back a cited report. `deep_research` runs a bounde
 
 | Tool | Purpose |
 |------|---------|
-| `deep_research(question, max_rounds=100, wall_clock_seconds=9000, model=None, verbosity="progress", max_queries_per_round=5, results_per_query=10, max_reads_per_round=10, page_char_limit=150000, report_token_cap=8000)` | Run a bounded, cited web-research loop for one question and return a JSON report envelope |
+| `deep_research(question, max_rounds=100, wall_clock_seconds=9000, model=None, verbosity="progress", max_queries_per_round=5, results_per_query=10, max_reads_per_round=10, page_char_limit=150000, report_token_cap=16000, parallel_researchers=1, extract_model=None)` | Run a bounded, cited web-research loop for one question and return a JSON report envelope |
 
 The returned envelope includes `status`, `report` (Markdown with `[n]` citations), `sources`, `confidence`, `rounds_used`, `stopped_reason`, `elapsed_seconds`, any `warnings`, and `stats` (counts of searches, reads, extractions, retries skipped as duplicates, and failures).
 
@@ -53,7 +55,9 @@ Parameters:
 - `results_per_query` — search results fetched per query (default `10`, capped at `30`; Serper accepts larger `num` values, the cap keeps candidate lists within prompt budget).
 - `max_reads_per_round` — maximum URLs read in one read round (default `10`, capped at `20`).
 - `page_char_limit` — maximum page text passed to extraction (default `150000` chars, capped at `600000`).
-- `report_token_cap` — approximate rolling report token budget (default `8000`, capped at `64000`).
+- `report_token_cap` — approximate rolling report token budget (default `16000`, capped at `64000`).
+- `parallel_researchers` — heavy mode: number of independent research loops run concurrently on different angles before one integrating synthesis (default `1`, capped at `4`; roughly multiplies token cost).
+- `extract_model` — route page extraction to a different (typically cheaper) configured model; defaults to the run's main model.
 
 ## Configuration
 

@@ -32,6 +32,7 @@ from .loop import (
     MAX_QUERIES_PER_ROUND_CAP,
     MAX_READS_PER_ROUND,
     MAX_READS_PER_ROUND_CAP,
+    PARALLEL_RESEARCHERS_CAP,
     REPORT_TOKEN_CAP,
     RESULTS_PER_QUERY,
     RESULTS_PER_QUERY_CAP,
@@ -42,6 +43,7 @@ from .loop import (
     SearchHit,
     SearchQuery,
     clamp_int,
+    run_heavy_research_loop,
     run_research_loop,
 )
 
@@ -208,7 +210,9 @@ def _format_round_progress(event: dict[str, object], *, verbose: bool) -> str:
     if len(thought) > 80:
         thought = thought[:77].rstrip() + "..."
     confidence = float(event.get("confidence") or 0)
-    line = f"round {event['round']}/{event['max_rounds']} · {confidence:.2f} · {thought}"
+    researcher = event.get("researcher")
+    prefix = f"researcher {researcher} · " if researcher else ""
+    line = f"{prefix}round {event['round']}/{event['max_rounds']} · {confidence:.2f} · {thought}"
     if not verbose:
         return line
     queries = event.get("search_queries")
@@ -246,8 +250,17 @@ class DeepResearchTools(Toolkit):
         max_reads_per_round: int = DEFAULT_MAX_READS_PER_ROUND,
         page_char_limit: int = DEFAULT_PAGE_CHAR_LIMIT,
         report_token_cap: int = DEFAULT_REPORT_TOKEN_CAP,
+        parallel_researchers: int = 1,
+        extract_model: str | None = None,
     ) -> str:
-        """Run a bounded deep research loop for one question."""
+        """Run a bounded deep research loop for one question.
+
+        Set parallel_researchers > 1 for heavy mode: N independent research
+        loops explore the question from different angles concurrently and a
+        final synthesis pass integrates their cited reports (roughly N times
+        the token cost). Set extract_model to route the high-volume page
+        extraction role to a cheaper model.
+        """
         normalized_question = question.strip() if isinstance(question, str) else ""
         if not normalized_question:
             return _error("question must be a non-empty string")
@@ -276,18 +289,34 @@ class DeepResearchTools(Toolkit):
                 minimum=MIN_REPORT_TOKEN_CAP,
                 maximum=MAX_REPORT_TOKEN_CAP,
             )
+            parallel_researchers = clamp_int(
+                parallel_researchers,
+                minimum=1,
+                maximum=PARALLEL_RESEARCHERS_CAP,
+            )
             verbosity = (
                 verbosity
                 if isinstance(verbosity, str) and verbosity in {"silent", "progress", "verbose"}
                 else "progress"
             )
             model_name = _resolve_model_name(context, model)
+            extract_model_name = _resolve_model_name(context, extract_model) if extract_model else model_name
             execution_identity = build_execution_identity_from_runtime_context(context)
             live_model = get_model_instance(
                 context.config,
                 context.runtime_paths,
                 model_name,
                 execution_identity=execution_identity,
+            )
+            extract_live_model = (
+                live_model
+                if extract_model_name == model_name
+                else get_model_instance(
+                    context.config,
+                    context.runtime_paths,
+                    extract_model_name,
+                    execution_identity=execution_identity,
+                )
             )
         except Exception as exc:
             LOGGER.warning("deep_research_model_resolution_failed", error=str(exc))
@@ -335,7 +364,7 @@ class DeepResearchTools(Toolkit):
         async def extract_fn(prompt: str) -> object:
             counters["extract"] += 1
             agent = Agent(
-                model=live_model,
+                model=extract_live_model,
                 output_schema=Extraction,
                 telemetry=False,
                 markdown=False,
@@ -374,27 +403,32 @@ class DeepResearchTools(Toolkit):
 
         try:
             if verbosity != "silent":
+                researchers_note = f" · {parallel_researchers} researchers" if parallel_researchers > 1 else ""
                 await _emit_message(
                     context,
-                    f"deep_research started · {max_rounds} rounds · {model_name}",
+                    f"deep_research started · {max_rounds} rounds · {model_name}{researchers_note}",
                     timeout_seconds=remaining_wall_clock_seconds(),
                 )
-            result = await run_research_loop(
-                question=normalized_question,
-                max_rounds=max_rounds,
-                wall_clock_seconds=wall_clock_seconds,
-                reason_fn=reason_fn,
-                extract_fn=extract_fn,
-                search_fn=search_fn,
-                read_fn=read_fn,
-                synthesize_fn=synthesize_fn,
-                emit_fn=emit_fn,
-                budget_start=wrapper_start,
-                max_queries_per_round=max_queries_per_round,
-                results_per_query=results_per_query,
-                max_reads_per_round=max_reads_per_round,
-                report_char_cap=report_token_cap * 4,
-            )
+            loop_kwargs: dict[str, object] = {
+                "question": normalized_question,
+                "max_rounds": max_rounds,
+                "wall_clock_seconds": wall_clock_seconds,
+                "reason_fn": reason_fn,
+                "extract_fn": extract_fn,
+                "search_fn": search_fn,
+                "read_fn": read_fn,
+                "synthesize_fn": synthesize_fn,
+                "emit_fn": emit_fn,
+                "budget_start": wrapper_start,
+                "max_queries_per_round": max_queries_per_round,
+                "results_per_query": results_per_query,
+                "max_reads_per_round": max_reads_per_round,
+                "report_char_cap": report_token_cap * 4,
+            }
+            if parallel_researchers > 1:
+                result = await run_heavy_research_loop(researchers=parallel_researchers, **loop_kwargs)
+            else:
+                result = await run_research_loop(**loop_kwargs)
             if verbosity != "silent":
                 await _emit_message(
                     context,
