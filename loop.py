@@ -973,12 +973,16 @@ def _remap_citation_ids(report_body: str, id_map: dict[int, int]) -> str:
 
 
 def _merge_researcher_results(
-    results: Sequence[LoopResult],
-) -> tuple[dict[str, SourceRecord], list[str]]:
-    """Merge researcher source registries and remap each report body to global ids."""
+    labeled_results: Sequence[tuple[int, LoopResult]],
+) -> tuple[dict[str, SourceRecord], list[tuple[int, str]]]:
+    """Merge researcher source registries and remap each report body to global ids.
+
+    Results carry their original 1-based researcher number so a failed
+    researcher does not shift the attribution of the survivors.
+    """
     merged: dict[str, SourceRecord] = {}
-    remapped_reports: list[str] = []
-    for result in results:
+    remapped_reports: list[tuple[int, str]] = []
+    for label, result in labeled_results:
         id_map: dict[int, int] = {}
         for source in result.sources:
             url = str(source.get("url") or "").strip()
@@ -991,8 +995,14 @@ def _merge_researcher_results(
                 snippet=str(source.get("snippet") or ""),
             )
             id_map[int(source["id"])] = record.id
-        remapped_reports.append(_remap_citation_ids(_report_body(result.report).rstrip(), id_map))
+        remapped_reports.append((label, _remap_citation_ids(_report_body(result.report).rstrip(), id_map)))
     return merged, remapped_reports
+
+
+def _researcher_wall_clock(wall_clock_seconds: int) -> int:
+    """Researcher budget that leaves a synthesis reserve, scaled down for small budgets."""
+    reserve = min(SYNTHESIS_RESERVE_SECONDS, max(0, wall_clock_seconds - 60) // 2)
+    return max(60, wall_clock_seconds - reserve)
 
 
 _STOP_REASON_PRIORITY: tuple[str, ...] = ("confident", "model_finished", "no_progress", "max_rounds", "wall_clock")
@@ -1073,7 +1083,7 @@ async def run_heavy_research_loop(
 
     start = clock() if budget_start is None else budget_start
     budget = _WallClockBudget(start=start, seconds=wall_clock_seconds, clock=clock)
-    researcher_wall_clock = max(60, wall_clock_seconds - SYNTHESIS_RESERVE_SECONDS)
+    researcher_wall_clock = _researcher_wall_clock(wall_clock_seconds)
 
     raw_results = await asyncio.gather(
         *(
@@ -1089,22 +1099,23 @@ async def run_heavy_research_loop(
     )
 
     warnings: list[str] = []
-    results: list[LoopResult] = []
+    labeled_results: list[tuple[int, LoopResult]] = []
     for index, raw in enumerate(raw_results):
         if isinstance(raw, LoopResult):
-            results.append(raw)
+            labeled_results.append((index + 1, raw))
             warnings.extend(f"researcher {index + 1}: {warning}" for warning in raw.warnings)
         else:
             warnings.append(f"researcher {index + 1} failed: {raw}")
-    if not results:
+    if not labeled_results:
         msg = "all researchers failed"
         raise RuntimeError(msg)
+    results = [result for _, result in labeled_results]
 
-    merged_sources_by_url, remapped_reports = _merge_researcher_results(results)
+    merged_sources_by_url, remapped_reports = _merge_researcher_results(labeled_results)
     sources = _sources_json(merged_sources_by_url)
     fallback_report = "\n\n".join(
-        f"## Researcher {index + 1} findings\n{body}"
-        for index, body in enumerate(remapped_reports)
+        f"## Researcher {label} findings\n{body}"
+        for label, body in remapped_reports
         if body.strip()
     ).strip() or "All researchers stopped before producing findings."
 

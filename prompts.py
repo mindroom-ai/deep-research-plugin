@@ -138,17 +138,17 @@ Requirements:
 def heavy_synthesize_prompt(
     *,
     question: str,
-    reports: Sequence[str],
+    reports: Sequence[tuple[int, str]],
     sources: Sequence[dict[str, object]],
 ) -> str:
-    """Build the synthesis prompt that integrates multiple researcher reports."""
+    """Build the synthesis prompt that integrates multiple labeled researcher reports."""
     source_lines = "\n".join(
         f"[{source['id']}] {source.get('title') or source.get('url')} - {source.get('url')}"
         for source in sources
     )
     report_sections = "\n\n".join(
-        f"### Researcher {index + 1} report\n{report.strip() or '(no findings)'}"
-        for index, report in enumerate(reports)
+        f"### Researcher {label} report\n{report.strip() or '(no findings)'}"
+        for label, report in reports
     )
     return f"""Integrate several independent research reports into one final Markdown report.
 
@@ -165,6 +165,8 @@ Requirements:
 - Where researchers disagree, weigh the evidence and note the disagreement.
 - Use inline [n] citations for source-backed claims; only attribute a claim
   to a source when a researcher's report supports it.
+- State uncertainty explicitly where the researcher reports provide thin,
+  conflicting, or incomplete evidence.
 - Include a final section exactly titled "## Sources".
 - In the sources section, list every cited source as "[n] title - URL".
 - Do not invent citations that are not in the source registry.

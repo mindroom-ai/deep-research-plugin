@@ -1606,7 +1606,9 @@ async def test_heavy_mode_merges_sources_and_remaps_citations() -> None:
 
 
 @pytest.mark.asyncio
-async def test_heavy_mode_researcher_failure_degrades_to_survivors() -> None:
+async def test_heavy_mode_researcher_failure_degrades_and_keeps_attribution() -> None:
+    synthesize_prompts: list[str] = []
+
     async def reason(_prompt: str) -> Any:
         return loop.ResearchStep(
             thought="finish",
@@ -1617,8 +1619,12 @@ async def test_heavy_mode_researcher_failure_degrades_to_survivors() -> None:
         )
 
     async def emit(event: dict[str, Any]) -> None:
-        if event.get("researcher") == 2:
+        if event.get("researcher") == 1:
             raise RuntimeError("boom")
+
+    async def synthesize(prompt: str) -> str:
+        synthesize_prompts.append(prompt)
+        return "final report"
 
     result = await loop.run_heavy_research_loop(
         question="q",
@@ -1629,12 +1635,22 @@ async def test_heavy_mode_researcher_failure_degrades_to_survivors() -> None:
         extract_fn=_unused_extract,
         search_fn=_empty_search,
         read_fn=_unused_read,
-        synthesize_fn=_synthesize,
+        synthesize_fn=synthesize,
         emit_fn=emit,
     )
 
-    assert any("researcher 2 failed: boom" in warning for warning in result.warnings)
+    assert any("researcher 1 failed: boom" in warning for warning in result.warnings)
     assert result.stopped_reason == "model_finished"
+    # The surviving researcher keeps its original number in the synthesis prompt.
+    heavy_prompt = synthesize_prompts[-1]
+    assert "Researcher 2 report" in heavy_prompt
+    assert "Researcher 1 report" not in heavy_prompt
+
+
+def test_researcher_wall_clock_scales_synthesis_reserve() -> None:
+    assert loop._researcher_wall_clock(9000) == 9000 - loop.SYNTHESIS_RESERVE_SECONDS
+    assert loop._researcher_wall_clock(240) == 150  # reserve shrinks to 90
+    assert loop._researcher_wall_clock(60) == 60  # tiny budgets keep researchers viable
 
 
 @pytest.mark.asyncio
