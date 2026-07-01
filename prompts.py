@@ -28,16 +28,19 @@ def reasoner_prompt(
     max_reads: int = 10,
     recent_queries: Sequence[str] = (),
     fetched_urls: Sequence[str] = (),
+    angle: str = "",
 ) -> str:
     """Build the structured reasoner prompt."""
     evidence_text = "\n".join(f"- {item}" for item in pending_evidence) or "- (no new evidence)"
     sources_text = "\n".join(f"- {item}" for item in sources) or "- (no sources yet)"
     queries_text = "\n".join(f"- {item}" for item in recent_queries) or "- (none yet)"
     fetched_text = "\n".join(f"- {item}" for item in fetched_urls) or "- (none yet)"
+    angle_text = f"\nYour assigned research angle (let it guide your queries and reads):\n{angle}\n" if angle else ""
     return f"""You are the planning and compression step in an iterative research loop.
 
 Question:
 {question}
+{angle_text}
 
 Current compressed report, which your updated_report must replace:
 {report or "(empty)"}
@@ -124,6 +127,44 @@ Source registry:
 
 Requirements:
 - Use inline [n] citations for source-backed claims.
+- Only attribute a claim to a source when the workspace or evidence notes
+  support it; state uncertainty explicitly where evidence is thin.
+- Include a final section exactly titled "## Sources".
+- In the sources section, list every cited source as "[n] title - URL".
+- Do not invent citations that are not in the source registry.
+"""
+
+
+def heavy_synthesize_prompt(
+    *,
+    question: str,
+    reports: Sequence[str],
+    sources: Sequence[dict[str, object]],
+) -> str:
+    """Build the synthesis prompt that integrates multiple researcher reports."""
+    source_lines = "\n".join(
+        f"[{source['id']}] {source.get('title') or source.get('url')} - {source.get('url')}"
+        for source in sources
+    )
+    report_sections = "\n\n".join(
+        f"### Researcher {index + 1} report\n{report.strip() or '(no findings)'}"
+        for index, report in enumerate(reports)
+    )
+    return f"""Integrate several independent research reports into one final Markdown report.
+
+Question:
+{question}
+
+{report_sections}
+
+Source registry (citations in the reports above already use these global [n] ids):
+{source_lines or "(no sources)"}
+
+Requirements:
+- Integrate the researchers' findings into one coherent, concise answer.
+- Where researchers disagree, weigh the evidence and note the disagreement.
+- Use inline [n] citations for source-backed claims; only attribute a claim
+  to a source when a researcher's report supports it.
 - Include a final section exactly titled "## Sources".
 - In the sources section, list every cited source as "[n] title - URL".
 - Do not invent citations that are not in the source registry.

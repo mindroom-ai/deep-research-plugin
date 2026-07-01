@@ -12,7 +12,7 @@ from typing import Literal, TypeVar
 
 from pydantic import BaseModel, Field, ValidationError
 
-from .prompts import extractor_prompt, reasoner_prompt, synthesize_prompt
+from .prompts import extractor_prompt, heavy_synthesize_prompt, reasoner_prompt, synthesize_prompt
 
 CONFIDENCE_STOP = 0.8
 MAX_ROUNDS_CAP = 100
@@ -23,9 +23,9 @@ RESULTS_PER_QUERY = 10
 RESULTS_PER_QUERY_CAP = 30
 MAX_READS_PER_ROUND = 10
 MAX_READS_PER_ROUND_CAP = 20
-REPORT_TOKEN_CAP = 8_000
+REPORT_TOKEN_CAP = 16_000
 REPORT_CHAR_CAP = REPORT_TOKEN_CAP * 4
-NO_PROGRESS_LIMIT = 2
+NO_PROGRESS_LIMIT = 3
 OP_TIMEOUT_SECONDS = 120.0
 RETRY_ATTEMPTS = 2
 RETRY_BACKOFF_SECONDS = 0.5
@@ -35,6 +35,14 @@ EVIDENCE_DIGEST_CHAR_CAP = 20_000
 RECENT_QUERIES_PROMPT_CAP = 15
 FETCHED_URLS_PROMPT_CAP = 20
 UNVETTED_EXCERPT_CHARS = 400
+PARALLEL_RESEARCHERS_CAP = 4
+SYNTHESIS_RESERVE_SECONDS = 180
+RESEARCH_ANGLES = (
+    "comprehensive overview: map the topic broadly and establish the key facts",
+    "primary sources: official data, original documents, and concrete numbers",
+    "skeptical verification: counterevidence, criticisms, and known failure modes",
+    "recency: the latest developments, announcements, and current state",
+)
 
 StructuredT = TypeVar("StructuredT", bound=BaseModel)
 AwaitedT = TypeVar("AwaitedT")
@@ -460,6 +468,51 @@ def _wall_clock_warning(label: str) -> str:
     return f"wall clock expired during {label}"
 
 
+async def _finalize_report(
+    *,
+    final_prompt: str,
+    fallback_report: str,
+    sources: list[dict[str, object]],
+    sources_by_url: dict[str, SourceRecord],
+    synthesize_fn: SynthesizeFn,
+    budget: _WallClockBudget,
+    warnings: list[str],
+) -> tuple[str, bool]:
+    """Run final synthesis with citation repair; return (report, wall_clock_expired)."""
+    try:
+        final_report = _ensure_sources_section(
+            await budget.wait_for("final synthesis", lambda: synthesize_fn(final_prompt)),
+            sources,
+            sources_by_url,
+        )
+        if _needs_citation_retry(final_report, sources_by_url):
+            retried_report = _ensure_sources_section(
+                await budget.wait_for(
+                    "final synthesis citation retry",
+                    lambda: synthesize_fn(_citation_retry_prompt(final_prompt)),
+                ),
+                sources,
+                sources_by_url,
+            )
+            if _has_valid_citations(retried_report, sources_by_url):
+                final_report = retried_report
+            else:
+                warnings.append("final synthesis produced no valid citations after retry")
+                fallback_with_sources = _ensure_sources_section(fallback_report, sources, sources_by_url)
+                final_report = (
+                    fallback_with_sources
+                    if _has_valid_citations(fallback_with_sources, sources_by_url)
+                    else retried_report
+                )
+    except _WallClockExpired as exc:
+        warnings.append(_wall_clock_warning(exc.label))
+        return _ensure_sources_section(fallback_report, sources, sources_by_url), True
+    except Exception as exc:
+        warnings.append(f"final synthesis failed: {exc}")
+        return _ensure_sources_section(fallback_report, sources, sources_by_url), False
+    return final_report, False
+
+
 async def _run_worker_batch(  # noqa: C901
     workers: Sequence[tuple[list[str], Awaitable[None]]],
     *,
@@ -523,6 +576,7 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     op_timeout_seconds: float = OP_TIMEOUT_SECONDS,
     retry_backoff_seconds: float = RETRY_BACKOFF_SECONDS,
     max_concurrency: int = MAX_CONCURRENCY,
+    angle: str = "",
 ) -> LoopResult:
     """Run the bounded research loop using injected LLM and network callables."""
     max_rounds = clamp_int(max_rounds, minimum=1, maximum=MAX_ROUNDS_CAP)
@@ -632,6 +686,7 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
             max_reads=max_reads_per_round,
             recent_queries=executed_queries[-RECENT_QUERIES_PROMPT_CAP:],
             fetched_urls=attempted_read_order[-FETCHED_URLS_PROMPT_CAP:],
+            angle=angle,
         )
         fallback_step = ResearchStep(
             thought="Structured reasoner output failed; skipping this round.",
@@ -872,38 +927,17 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     fallback_report = _final_workspace(report, pending_evidence).strip()
     if not fallback_report:
         fallback_report = "Research stopped because the wall-clock budget expired before a final report was produced."
-    try:
-        final_report = _ensure_sources_section(
-            await budget.wait_for("final synthesis", lambda: synthesize_fn(final_prompt)),
-            sources,
-            sources_by_url,
-        )
-        if _needs_citation_retry(final_report, sources_by_url):
-            retried_report = _ensure_sources_section(
-                await budget.wait_for(
-                    "final synthesis citation retry",
-                    lambda: synthesize_fn(_citation_retry_prompt(final_prompt)),
-                ),
-                sources,
-                sources_by_url,
-            )
-            if _has_valid_citations(retried_report, sources_by_url):
-                final_report = retried_report
-            else:
-                warnings.append("final synthesis produced no valid citations after retry")
-                fallback_with_sources = _ensure_sources_section(fallback_report, sources, sources_by_url)
-                final_report = (
-                    fallback_with_sources
-                    if _has_valid_citations(fallback_with_sources, sources_by_url)
-                    else retried_report
-                )
-    except _WallClockExpired as exc:
+    final_report, synthesis_expired = await _finalize_report(
+        final_prompt=final_prompt,
+        fallback_report=fallback_report,
+        sources=sources,
+        sources_by_url=sources_by_url,
+        synthesize_fn=synthesize_fn,
+        budget=budget,
+        warnings=warnings,
+    )
+    if synthesis_expired:
         stopped_reason = "wall_clock"
-        warnings.append(_wall_clock_warning(exc.label))
-        final_report = _ensure_sources_section(fallback_report, sources, sources_by_url)
-    except Exception as exc:
-        warnings.append(f"final synthesis failed: {exc}")
-        final_report = _ensure_sources_section(fallback_report, sources, sources_by_url)
     elapsed = budget.elapsed()
     sources_used = _cited_source_count(final_report, sources_by_url)
 
@@ -917,6 +951,188 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
         rounds_used=rounds_used,
         stopped_reason=stopped_reason,
         elapsed_seconds=elapsed,
+        warnings=warnings,
+        stats=stats,
+    )
+
+
+def _remap_citation_ids(report_body: str, id_map: dict[int, int]) -> str:
+    """Rewrite [n] citation groups through id_map, dropping ids that do not map."""
+
+    def remap_group(match: re.Match[str]) -> str:
+        kept_ids: list[int] = []
+        for cited_id in (int(part.strip()) for part in match.group(1).split(",")):
+            mapped = id_map.get(cited_id)
+            if mapped is not None and mapped not in kept_ids:
+                kept_ids.append(mapped)
+        if not kept_ids:
+            return ""
+        return "[" + ", ".join(str(cited_id) for cited_id in kept_ids) + "]"
+
+    return _NUMERIC_CITATION_GROUP_RE.sub(remap_group, report_body)
+
+
+def _merge_researcher_results(
+    results: Sequence[LoopResult],
+) -> tuple[dict[str, SourceRecord], list[str]]:
+    """Merge researcher source registries and remap each report body to global ids."""
+    merged: dict[str, SourceRecord] = {}
+    remapped_reports: list[str] = []
+    for result in results:
+        id_map: dict[int, int] = {}
+        for source in result.sources:
+            url = str(source.get("url") or "").strip()
+            if not url:
+                continue
+            record, _ = _register_source(
+                merged,
+                url=url,
+                title=str(source.get("title") or ""),
+                snippet=str(source.get("snippet") or ""),
+            )
+            id_map[int(source["id"])] = record.id
+        remapped_reports.append(_remap_citation_ids(_report_body(result.report).rstrip(), id_map))
+    return merged, remapped_reports
+
+
+_STOP_REASON_PRIORITY: tuple[str, ...] = ("confident", "model_finished", "no_progress", "max_rounds", "wall_clock")
+
+
+def _combined_stopped_reason(
+    results: Sequence[LoopResult],
+) -> Literal["confident", "model_finished", "max_rounds", "wall_clock", "no_progress"]:
+    reasons = {result.stopped_reason for result in results}
+    for reason in _STOP_REASON_PRIORITY:
+        if reason in reasons:
+            return reason  # type: ignore[return-value]
+    return "max_rounds"  # pragma: no cover
+
+
+async def run_heavy_research_loop(
+    *,
+    question: str,
+    researchers: int,
+    max_rounds: int,
+    wall_clock_seconds: int,
+    reason_fn: ReasonFn,
+    extract_fn: ExtractFn,
+    search_fn: SearchFn,
+    read_fn: ReadFn,
+    synthesize_fn: SynthesizeFn,
+    emit_fn: EmitFn | None = None,
+    clock: ClockFn = time.monotonic,
+    budget_start: float | None = None,
+    max_queries_per_round: int = MAX_QUERIES_PER_ROUND,
+    results_per_query: int = RESULTS_PER_QUERY,
+    max_reads_per_round: int = MAX_READS_PER_ROUND,
+    report_char_cap: int = REPORT_CHAR_CAP,
+    op_timeout_seconds: float = OP_TIMEOUT_SECONDS,
+    retry_backoff_seconds: float = RETRY_BACKOFF_SECONDS,
+    max_concurrency: int = MAX_CONCURRENCY,
+) -> LoopResult:
+    """Run N research loops on different angles concurrently and synthesize one report.
+
+    This is the IterResearch "Heavy mode" (Research-Synthesis) pattern: each
+    researcher explores the question independently, and a final synthesis pass
+    integrates their cited reports over a merged source registry.
+    """
+    researchers = clamp_int(researchers, minimum=1, maximum=PARALLEL_RESEARCHERS_CAP)
+    wall_clock_seconds = clamp_int(wall_clock_seconds, minimum=60, maximum=WALL_CLOCK_SECONDS_CAP)
+
+    def researcher_kwargs(index: int) -> dict[str, object]:
+        researcher_emit = emit_fn
+        if emit_fn is not None and researchers > 1:
+            async def tagged_emit(event: dict[str, object], researcher: int = index + 1) -> None:
+                await emit_fn({**event, "researcher": researcher})
+            researcher_emit = tagged_emit
+        return {
+            "question": question,
+            "max_rounds": max_rounds,
+            "reason_fn": reason_fn,
+            "extract_fn": extract_fn,
+            "search_fn": search_fn,
+            "read_fn": read_fn,
+            "synthesize_fn": synthesize_fn,
+            "emit_fn": researcher_emit,
+            "clock": clock,
+            "max_queries_per_round": max_queries_per_round,
+            "results_per_query": results_per_query,
+            "max_reads_per_round": max_reads_per_round,
+            "report_char_cap": report_char_cap,
+            "op_timeout_seconds": op_timeout_seconds,
+            "retry_backoff_seconds": retry_backoff_seconds,
+            "max_concurrency": max_concurrency,
+        }
+
+    if researchers == 1:
+        return await run_research_loop(
+            wall_clock_seconds=wall_clock_seconds,
+            budget_start=budget_start,
+            **researcher_kwargs(0),  # type: ignore[arg-type]
+        )
+
+    start = clock() if budget_start is None else budget_start
+    budget = _WallClockBudget(start=start, seconds=wall_clock_seconds, clock=clock)
+    researcher_wall_clock = max(60, wall_clock_seconds - SYNTHESIS_RESERVE_SECONDS)
+
+    raw_results = await asyncio.gather(
+        *(
+            run_research_loop(
+                wall_clock_seconds=researcher_wall_clock,
+                budget_start=start,
+                angle=RESEARCH_ANGLES[index % len(RESEARCH_ANGLES)],
+                **researcher_kwargs(index),  # type: ignore[arg-type]
+            )
+            for index in range(researchers)
+        ),
+        return_exceptions=True,
+    )
+
+    warnings: list[str] = []
+    results: list[LoopResult] = []
+    for index, raw in enumerate(raw_results):
+        if isinstance(raw, LoopResult):
+            results.append(raw)
+            warnings.extend(f"researcher {index + 1}: {warning}" for warning in raw.warnings)
+        else:
+            warnings.append(f"researcher {index + 1} failed: {raw}")
+    if not results:
+        msg = "all researchers failed"
+        raise RuntimeError(msg)
+
+    merged_sources_by_url, remapped_reports = _merge_researcher_results(results)
+    sources = _sources_json(merged_sources_by_url)
+    fallback_report = "\n\n".join(
+        f"## Researcher {index + 1} findings\n{body}"
+        for index, body in enumerate(remapped_reports)
+        if body.strip()
+    ).strip() or "All researchers stopped before producing findings."
+
+    final_report, synthesis_expired = await _finalize_report(
+        final_prompt=heavy_synthesize_prompt(question=question, reports=remapped_reports, sources=sources),
+        fallback_report=fallback_report,
+        sources=sources,
+        sources_by_url=merged_sources_by_url,
+        synthesize_fn=synthesize_fn,
+        budget=budget,
+        warnings=warnings,
+    )
+
+    stats: dict[str, int] = {}
+    for result in results:
+        for key, value in result.stats.items():
+            stats[key] = stats.get(key, 0) + value
+
+    return LoopResult(
+        question=question,
+        report=final_report,
+        sources=sources,
+        sources_considered=sum(result.sources_considered for result in results),
+        sources_used=_cited_source_count(final_report, merged_sources_by_url),
+        confidence=max(result.confidence for result in results),
+        rounds_used=sum(result.rounds_used for result in results),
+        stopped_reason="wall_clock" if synthesis_expired else _combined_stopped_reason(results),
+        elapsed_seconds=budget.elapsed(),
         warnings=warnings,
         stats=stats,
     )
