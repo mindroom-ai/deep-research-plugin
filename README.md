@@ -23,6 +23,8 @@ Ask one hard question and get back a cited report. `deep_research` runs a bounde
 - Final synthesis gets its own reserved slice of the wall clock (search rounds stop early to leave it), and `stopped_reason: "synthesis_truncated"` flags the rare case where the report itself was cut short
 - Searches and page reads run concurrently within a round (bounded concurrency)
 - Duplicate queries and already-fetched URLs are skipped across rounds, and the reasoner is told what was already tried
+- In heavy mode, page fetches and extractions are shared across researchers, so parallel researchers converging on the same URL cost one fetch and one extraction instead of N
+- A page that cannot be read (e.g. a 403 anti-bot response) degrades to its search snippet as a clearly-labeled unvetted source instead of vanishing from the evidence pool
 - Confidence-based stopping is evidence-gated (requires at least one registered source), plus no-progress stopping
 - A transiently failing reasoner call skips the round instead of ending the run
 - Streams per-round progress into the thread, or runs quietly on request

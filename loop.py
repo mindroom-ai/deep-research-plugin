@@ -8,7 +8,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal, TypeVar
+from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -617,6 +617,7 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
         "extractions": 0,
         "duplicate_queries_skipped": 0,
         "duplicate_reads_skipped": 0,
+        "read_snippet_fallbacks": 0,
     }
     start = clock() if budget_start is None else budget_start
     total_budget = _WallClockBudget(start=start, seconds=wall_clock_seconds, clock=clock)
@@ -822,6 +823,21 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
                 stats["read_attempts"] += 1
                 return await read_fn(url)
 
+            def snippet_fallback() -> None:
+                # A blocked or failing page (e.g. a 403 anti-bot response)
+                # degrades to its search snippet instead of vanishing from
+                # the evidence pool; the fact is labeled unvetted.
+                _, snippet = candidate_meta.get(url, ("", ""))
+                snippet = snippet.strip()
+                if not snippet:
+                    return
+                stats["read_snippet_fallbacks"] += 1
+                read_results[index] = (
+                    url,
+                    Page(url=url, title="", text=""),
+                    Extraction(facts=[f"Unvetted search snippet: {snippet}"], relevant=True),
+                )
+
             try:
                 page = _coerce_page(
                     await _attempt_with_retries(
@@ -838,10 +854,12 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
             except _OpTimeoutError:
                 stats["read_failures"] += 1
                 warnings.append(f"timed out during {phase[0]}")
+                snippet_fallback()
                 return
             except Exception as exc:
                 stats["read_failures"] += 1
                 warnings.append(f"read failed for {url}: {exc}")
+                snippet_fallback()
                 return
             phase[0] = f"extractor for {url}"
             stats["extractions"] += 1
@@ -1026,6 +1044,43 @@ def _researcher_wall_clock(wall_clock_seconds: int) -> int:
     return max(60, wall_clock_seconds - reserve)
 
 
+class _SharedCallCache(Generic[AwaitedT]):
+    """Share in-flight and completed single-argument calls across researchers.
+
+    Heavy-mode researchers explore the same question concurrently, so they
+    frequently pick the same URLs to read (and therefore build identical
+    extraction prompts). Routing those calls through one shared task per key
+    means each page is fetched and extracted at most once across the fleet.
+    Failed or cancelled calls are not cached: the next caller re-issues them,
+    which keeps the per-researcher retry semantics intact.
+    """
+
+    def __init__(self, fn: Callable[[str], Awaitable[AwaitedT]]) -> None:
+        self._fn = fn
+        self._tasks: dict[str, asyncio.Task[AwaitedT]] = {}
+        self.hits = 0
+
+    async def __call__(self, key: str) -> AwaitedT:
+        task = self._tasks.get(key)
+        if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
+            task = asyncio.ensure_future(self._fn(key))
+            # Retrieve exceptions eagerly so a task whose awaiters were all
+            # cancelled does not log "exception was never retrieved".
+            task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
+            self._tasks[key] = task
+        else:
+            self.hits += 1
+        # Awaiting a shared task does not propagate this caller's
+        # cancellation to it, so other researchers can still use the result.
+        return await task
+
+    def cancel_pending(self) -> None:
+        """Cancel calls still in flight once no researcher can use them."""
+        for task in self._tasks.values():
+            if not task.done():
+                task.cancel()
+
+
 _STOP_REASON_PRIORITY: tuple[str, ...] = (
     "confident",
     "model_finished",
@@ -1113,6 +1168,14 @@ async def run_heavy_research_loop(
     budget = _WallClockBudget(start=start, seconds=wall_clock_seconds, clock=clock)
     researcher_wall_clock = _researcher_wall_clock(wall_clock_seconds)
 
+    # Researchers often converge on the same URLs (they all start from the
+    # same question), so page reads and extractions are shared across the
+    # fleet; researcher_kwargs picks up the rebound callables.
+    shared_read_fn: _SharedCallCache[Page | dict[str, object] | str] = _SharedCallCache(read_fn)
+    shared_extract_fn: _SharedCallCache[object] = _SharedCallCache(extract_fn)
+    read_fn = shared_read_fn
+    extract_fn = shared_extract_fn
+
     raw_results = await asyncio.gather(
         *(
             run_research_loop(
@@ -1125,6 +1188,8 @@ async def run_heavy_research_loop(
         ),
         return_exceptions=True,
     )
+    shared_read_fn.cancel_pending()
+    shared_extract_fn.cancel_pending()
 
     warnings: list[str] = []
     labeled_results: list[tuple[int, LoopResult]] = []
@@ -1161,6 +1226,8 @@ async def run_heavy_research_loop(
     for result in results:
         for key, value in result.stats.items():
             stats[key] = stats.get(key, 0) + value
+    stats["cross_researcher_reads_shared"] = shared_read_fn.hits
+    stats["cross_researcher_extracts_shared"] = shared_extract_fn.hits
 
     return LoopResult(
         question=question,
