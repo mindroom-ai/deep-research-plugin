@@ -1358,6 +1358,53 @@ async def test_slow_read_times_out_per_operation_and_run_continues() -> None:
     assert result.stopped_reason == "model_finished"
     assert result.rounds_used == 2
     assert any("timed out during read for https://example.com/slow" in warning for warning in result.warnings)
+    # A directly requested URL counts as considered even though the read failed.
+    assert result.sources_considered == 1
+
+
+@pytest.mark.asyncio
+async def test_same_hit_from_overlapping_queries_appears_once_in_pending_evidence() -> None:
+    reason_calls = 0
+    prompts: list[str] = []
+
+    async def reason(prompt: str) -> Any:
+        nonlocal reason_calls
+        reason_calls += 1
+        prompts.append(prompt)
+        if reason_calls == 1:
+            return loop.ResearchStep(
+                thought="two overlapping queries",
+                updated_report="r",
+                open_questions=[],
+                confidence=0.1,
+                next_action="search",
+                search_queries=[loop.SearchQuery(query="angle one"), loop.SearchQuery(query="angle two")],
+            )
+        return loop.ResearchStep(
+            thought="finish",
+            updated_report="r",
+            open_questions=[],
+            confidence=0.1,
+            next_action="finish",
+        )
+
+    async def search(query: Any, _limit: int) -> list[Any]:
+        if query.query == "q":
+            return []
+        return [{"url": "https://example.com/shared", "title": "Shared", "snippet": "same snippet"}]
+
+    await loop.run_research_loop(
+        question="q",
+        max_rounds=2,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=search,
+        read_fn=_unused_read,
+        synthesize_fn=_synthesize,
+    )
+
+    assert prompts[1].count("Candidate URL: Shared - https://example.com/shared") == 1
 
 
 @pytest.mark.asyncio

@@ -148,17 +148,7 @@ class _WallClockBudget:
         return self.remaining() <= 0
 
     async def wait_for(self, label: str, fn: Callable[[], Awaitable[AwaitedT]]) -> AwaitedT:
-        remaining = self.remaining()
-        if remaining <= 0:
-            raise _WallClockExpired(label)
-        timeout = asyncio.timeout(remaining)
-        try:
-            async with timeout:
-                return await fn()
-        except TimeoutError as exc:
-            if timeout.expired():
-                raise _WallClockExpired(label) from exc
-            raise
+        return await self.wait_for_op(label, fn, float("inf"))
 
     async def wait_for_op(
         self,
@@ -619,8 +609,9 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     pending_evidence: list[str] = []
     for hit in seed_hits[:results_per_query]:
         evidence_line = _note_candidate(hit)
+        if evidence_line not in seen_evidence:
+            pending_evidence.append(evidence_line)
         seen_evidence.add(evidence_line)
-        pending_evidence.append(evidence_line)
     if not pending_evidence:
         pending_evidence = ["(no new evidence)"]
 
@@ -728,6 +719,9 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
                 continue
             attempted_read_urls.add(url)
             attempted_read_order.append(url)
+            # A directly requested URL counts as considered even if the read
+            # later fails; search hits are counted in _note_candidate.
+            considered_urls.add(url)
             planned_urls.append(url)
 
         search_results: dict[int, list[SearchHit]] = {}
@@ -814,8 +808,8 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
                 evidence_line = _note_candidate(hit)
                 if evidence_line not in seen_evidence:
                     made_progress = True
+                    evidence.append(evidence_line)
                 seen_evidence.add(evidence_line)
-                evidence.append(evidence_line)
 
         for index in sorted(read_results):
             url, page, extraction = read_results[index]
@@ -842,8 +836,8 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
                 evidence_line = f"[{source.id}] {fact}"
                 if is_new or evidence_line not in seen_evidence:
                     made_progress = True
+                    evidence.append(evidence_line)
                 seen_evidence.add(evidence_line)
-                evidence.append(evidence_line)
 
         if stopped_reason == "wall_clock":
             pending_evidence = evidence or ["(no new evidence)"]
