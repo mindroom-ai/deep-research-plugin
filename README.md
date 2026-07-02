@@ -15,7 +15,7 @@ Ask one hard question and get back a cited report. `deep_research` runs a bounde
 - Runs the loop on the caller's active MindRoom model — provider-agnostic, no model bundled
 - Heavy mode (`parallel_researchers`): up to 4 independent research loops explore the question from different angles concurrently, then one synthesis pass integrates their cited reports over a merged source registry (Tongyi DeepResearch's Research-Synthesis pattern)
 - Role-based model routing: `extract_model` sends the high-volume page-extraction role to a cheaper model while reasoning and synthesis stay on the strong one
-- Reuses MindRoom's existing tools: Serper search and the native website reader
+- Reuses MindRoom's existing tools: a configurable search tool (Serper by default) and the native website reader
 - Rolling summarize-and-replace report keeps long runs inside the context budget
 - Append-only per-source fact bank, so extracted facts survive compression and feed final synthesis
 - Stable `[n]` citations backed by a verified source registry that is the single source of truth
@@ -64,7 +64,25 @@ Parameters:
 
 ## Configuration
 
-`deep_research` uses whatever model the calling agent is configured with, and reuses MindRoom's Serper search and native website reader. Make sure the built-in Serper tool has an API key configured before enabling this plugin.
+`deep_research` uses whatever model the calling agent is configured with, and reuses a MindRoom search tool plus the native website reader. By default it uses the built-in Serper tool — make sure it has an API key configured before enabling this plugin.
+
+### Custom search backends
+
+Any registered MindRoom tool (built-in or from another plugin) can serve as the search backend. Configure it on the tool entry:
+
+```yaml
+agents:
+  researcher:
+    tools:
+      - deep_research:
+          search_tool: my_search      # registered tool name (default: serper)
+          search_function: search     # function used for every query kind
+```
+
+- `search_tool` — name of the registered tool to resolve for searches. If the calling agent's config also carries an entry for that tool (e.g. with project or API settings), those settings are reused when the search tool is built.
+- `search_function` — a single function on that tool, called as `fn(query)` (a `num_results` keyword is passed only when the function accepts one). All query kinds (web/news/scholar) route to it. Leave unset for Serper's `search_web`/`search_news`/`search_scholar` routing.
+
+The search function must return JSON. Both Serper-style payloads (`organic`/`news`/`scholar` rows with `link`/`title`/`snippet`) and generic shapes (`results`/`sources`/`items` rows with `url` or `uri`, `title`, and `snippet`/`description`/`domain`) are understood; payloads with `error` or `status: "error"` are surfaced as search failures.
 
 ## Setup
 
