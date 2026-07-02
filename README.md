@@ -39,6 +39,28 @@ Both are rebuilt onto MindRoom's existing model and tools instead of wrapping a 
 
 ## How It Works
 
+```mermaid
+flowchart TD
+    CALL["deep_research(question)"] --> FAN["1..N researchers in parallel<br/>(heavy mode gives each a distinct angle and shares page fetches)"]
+
+    subgraph LOOP["IterResearch loop — one researcher"]
+        PLAN["reasoner: compress workspace,<br/>plan queries + reads, flag open questions"] --> ACT["searches + page reads run concurrently<br/>(retries, per-operation timeouts)"]
+        ACT --> EXTRACT["extract facts per page<br/>(unreadable page degrades to its snippet)"]
+        EXTRACT --> UPDATE["update rolling report,<br/>source registry, fact bank"]
+        UPDATE --> STOP{"stop?<br/>confident + evidence + no open questions,<br/>model finish, no progress, budget"}
+        STOP -- "continue" --> PLAN
+    end
+
+    FAN --> LOOP
+    LOOP --> MERGE["merge source registries, renumber citations<br/>(no-op for a single researcher)"]
+    MERGE --> SYNTH["final synthesis<br/>(workspace + fact bank + registry)"]
+    SYNTH --> REPAIR["citation repair:<br/>rebuild the Sources section from the registry"]
+    REPAIR --> GATE{"grounding gate:<br/>cited claims supported by the evidence?"}
+    GATE -- "flagged" --> REGEN["regenerate once<br/>with the flagged claims"]
+    REGEN --> OUT["JSON envelope: cited report,<br/>sources, confidence, stats, warnings"]
+    GATE -- "pass" --> OUT
+```
+
 1. An agent calls `deep_research(question)` in a thread.
 2. The plugin resolves the caller's active model and builds an ephemeral, tool-less reasoning agent.
 3. Each round: the reasoner plans searches and/or page reads (both may run in the same round), which execute concurrently with retries and per-operation timeouts; extracted facts are folded into a rolling report with stable citations and banked per source.
