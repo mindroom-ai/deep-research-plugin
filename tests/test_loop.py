@@ -2251,3 +2251,55 @@ async def test_candidate_snippet_upgrades_when_a_later_hit_fills_the_gap() -> No
     assert result.stats["snippet_sources_registered"] == 1
     assert result.sources[0]["snippet"] == "The launch happened."
     assert result.sources[0]["title"] == "Primary PR"
+
+
+@pytest.mark.asyncio
+async def test_snippetless_stored_variant_does_not_shadow_canonical_equivalent() -> None:
+    calls = 0
+
+    async def reason(_prompt: str) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return loop.ResearchStep(
+                thought="search again from another angle",
+                updated_report="report",
+                open_questions=[],
+                confidence=0.1,
+                next_action="search",
+                search_queries=[loop.SearchQuery(query="another angle")],
+            )
+        return loop.ResearchStep(
+            thought="nominate the fragmented variant that was stored empty",
+            updated_report="answer [1]",
+            open_questions=[],
+            confidence=0.5,
+            next_action="finish",
+            cite_snippet_urls=["https://primary.example/press#section"],
+        )
+
+    search_calls = 0
+
+    async def search(_query: Any, _limit: int) -> list[Any]:
+        nonlocal search_calls
+        search_calls += 1
+        if search_calls == 1:
+            return [{"url": "https://primary.example/press#section", "title": " ", "snippet": " "}]
+        return [{"url": "https://primary.example/press", "title": "Primary PR", "snippet": "The launch happened."}]
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=3,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=search,
+        read_fn=_unused_read,
+        synthesize_fn=_synthesize,
+    )
+
+    # The exact-match empty variant must not shadow the canonical-equivalent
+    # entry that carries the snippet.
+    assert result.stats["snippet_sources_registered"] == 1
+    assert [source["url"] for source in result.sources] == ["https://primary.example/press"]
+    assert result.sources[0]["snippet"] == "The launch happened."

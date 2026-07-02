@@ -347,22 +347,28 @@ def _match_candidate(
 
     Both sides are compared in canonical form (fragment and trailing slash
     stripped), so a variant on either the nominated or the stored URL still
-    matches. Returns the stored candidate URL (not the nominated variant) so
+    matches. Among canonical-equivalent stored candidates, one with a
+    non-empty snippet wins, so an empty variant cannot shadow a useful one.
+    Returns the stored candidate URL (not the nominated variant) so
     downstream registration keys stay consistent with reads of the same page.
     """
     url = raw_url.strip()
     if not url:
         return None
-    meta = candidate_meta.get(url)
-    if meta is not None:
-        return url, meta
+    exact = candidate_meta.get(url)
+    if exact is not None and exact[1]:
+        return url, exact
+    fallback = (url, exact) if exact is not None else None
     canonical = _canonical_candidate_key(url)
-    if not canonical:
-        return None
-    for stored_url, stored_meta in candidate_meta.items():
-        if _canonical_candidate_key(stored_url) == canonical:
-            return stored_url, stored_meta
-    return None
+    if canonical:
+        for stored_url, stored_meta in candidate_meta.items():
+            if _canonical_candidate_key(stored_url) != canonical:
+                continue
+            if stored_meta[1]:
+                return stored_url, stored_meta
+            if fallback is None:
+                fallback = (stored_url, stored_meta)
+    return fallback
 
 
 def _coerce_hits(raw_hits: Sequence[SearchHit | dict[str, object]]) -> list[SearchHit]:
