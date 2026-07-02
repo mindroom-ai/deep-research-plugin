@@ -149,7 +149,8 @@ def _parse_search_results(raw: str) -> list[SearchHit]:
         return []
     error = parsed.get("error")
     if error or str(parsed.get("status") or "").lower() == "error":
-        raise RuntimeError(str(error or parsed.get("message") or parsed.get("description") or "search failed"))
+        detail = error or parsed.get("message") or parsed.get("description") or parsed.get("code")
+        raise RuntimeError(str(detail or "search failed"))
     rows: list[object] = []
     for key in ("organic", "news", "articles", "scholar", "results", "sources", "items"):
         value = parsed.get(key)

@@ -843,6 +843,8 @@ def test_parse_search_results_raises_on_status_error_payload() -> None:
 
     with pytest.raises(RuntimeError, match="rate limited"):
         module._parse_search_results(json.dumps({"status": "error", "message": "rate limited"}))
+    with pytest.raises(RuntimeError, match="RATE_LIMIT"):
+        module._parse_search_results(json.dumps({"status": "error", "code": "RATE_LIMIT"}))
 
 
 @pytest.mark.asyncio
