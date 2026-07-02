@@ -335,6 +335,33 @@ def _register_source(
     return record, True
 
 
+def _match_candidate(
+    candidate_meta: dict[str, tuple[str, str]],
+    raw_url: str,
+) -> tuple[str, tuple[str, str]] | None:
+    """Match a nominated URL to a stored candidate, tolerating fragment and trailing-slash variants.
+
+    Returns the stored candidate URL (not the nominated variant) so downstream
+    registration keys stay consistent with reads of the same page.
+    """
+    url = raw_url.strip()
+    if not url:
+        return None
+    variants = [url]
+    defragmented = url.split("#", 1)[0]
+    if defragmented and defragmented != url:
+        variants.append(defragmented)
+    for variant in list(variants):
+        toggled = variant.rstrip("/") if variant.endswith("/") else variant + "/"
+        if toggled and toggled not in variants:
+            variants.append(toggled)
+    for variant in variants:
+        meta = candidate_meta.get(variant)
+        if meta is not None:
+            return variant, meta
+    return None
+
+
 def _coerce_hits(raw_hits: Sequence[SearchHit | dict[str, object]]) -> list[SearchHit]:
     hits: list[SearchHit] = []
     for raw_hit in raw_hits:
@@ -665,7 +692,15 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     def _note_candidate(hit: SearchHit) -> str:
         url = hit.url.strip()
         considered_urls.add(url)
-        candidate_meta.setdefault(url, (hit.title, hit.snippet))
+        existing = candidate_meta.get(url)
+        if existing is None:
+            candidate_meta[url] = (hit.title, hit.snippet)
+        else:
+            # A later hit for the same URL may carry the title or snippet the
+            # first one lacked; fill gaps so snippet citation stays possible.
+            title, snippet = existing
+            if (not title and hit.title) or (not snippet and hit.snippet):
+                candidate_meta[url] = (title or hit.title, snippet or hit.snippet)
         return _candidate_line(hit)
 
     seed_query = SearchQuery(query=question)
@@ -769,23 +804,24 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
         # Reasoner-nominated candidates become citable unvetted sources from
         # their search snippet alone, without spending a page read. Only URLs
         # that actually appeared as search hits (candidate_meta) qualify, so
-        # a hallucinated URL cannot enter the registry. Runs before the stop
+        # a hallucinated URL cannot enter the registry; registration keys on
+        # the stored candidate URL, so a later full read of the same page
+        # upgrades the same source id with vetted facts. Runs before the stop
         # checks so a final "cite these and finish" step still lands.
         snippet_evidence: list[str] = []
         registered_snippet_sources = 0
         for raw_url in step.cite_snippet_urls:
             if registered_snippet_sources >= SNIPPET_SOURCES_PER_ROUND_CAP:
                 break
-            url = raw_url.strip()
-            if not url or url in sources_by_url:
+            match = _match_candidate(candidate_meta, raw_url)
+            if match is None:
                 continue
-            title, snippet = candidate_meta.get(url, ("", ""))
+            url, (title, snippet) = match
             snippet = snippet.strip()
-            if not snippet:
+            if not snippet or url in sources_by_url:
                 continue
             registered_snippet_sources += 1
             stats["snippet_sources_registered"] += 1
-            considered_urls.add(url)
             source, _ = _register_source(sources_by_url, url=url, title=title, snippet=snippet)
             fact = f"Unvetted search snippet: {snippet}"
             source_facts = facts_by_source.setdefault(source.id, [])
