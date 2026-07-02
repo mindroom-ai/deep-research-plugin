@@ -73,7 +73,7 @@ flowchart TD
 
 | Tool | Purpose |
 |------|---------|
-| `deep_research(question, max_rounds=100, wall_clock_seconds=9000, model=None, verbosity="progress", max_queries_per_round=5, results_per_query=10, max_reads_per_round=10, page_char_limit=150000, report_token_cap=16000, parallel_researchers=1, extract_model=None)` | Run a bounded, cited web-research loop for one question and return a JSON report envelope |
+| `deep_research(question, max_rounds=100, wall_clock_seconds=9000, model=None, verbosity="progress", max_queries_per_round=5, results_per_query=10, max_reads_per_round=10, page_char_limit=150000, report_token_cap=16000, parallel_researchers=1, extract_model=None, grounding=True, ground_model=None)` | Run a bounded, cited web-research loop for one question and return a JSON report envelope |
 
 The returned envelope includes `status`, `report` (Markdown with `[n]` citations), `sources`, `confidence`, `rounds_used`, `stopped_reason`, `elapsed_seconds`, any `warnings`, and `stats` (counts of searches, reads, extractions, retries skipped as duplicates, and failures).
 `stopped_reason` is one of `confident`, `model_finished`, `no_progress`, `max_rounds`, `wall_clock`, or `synthesis_truncated` — only the last one means the final report itself was cut short; every other reason still ends with a fully synthesized report.
@@ -92,6 +92,8 @@ Parameters:
 - `report_token_cap` — approximate rolling report token budget (default `16000`, capped at `64000`).
 - `parallel_researchers` — heavy mode: number of independent research loops run concurrently on different angles before one integrating synthesis (default `1`, capped at `4`; roughly multiplies token cost).
 - `extract_model` — route page extraction to a different (typically cheaper) configured model; defaults to the run's main model.
+- `grounding` — run the final grounding gate (default `true`); set `false` to skip it on quick bounded runs and save one or two LLM calls.
+- `ground_model` — run the grounding check on a different configured model than the writer (a separate checker decorrelates verification from generation); defaults to the run's main model.
 
 ## Configuration
 

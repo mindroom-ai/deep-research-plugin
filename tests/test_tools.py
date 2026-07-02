@@ -1478,3 +1478,65 @@ def test_parse_search_channels_drops_standalone_malformed_json_string() -> None:
     module = _load_tools_module()
 
     assert module._parse_search_channels('{"name": "broken"') == []
+
+
+@pytest.mark.asyncio
+async def test_ground_fn_is_wired_into_heavy_mode_loop_kwargs() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
+        patch.object(module, "run_heavy_research_loop", AsyncMock(return_value=_result(module))) as heavy_mock,
+    ):
+        result = json.loads(await tools.deep_research("What?", parallel_researchers=3))
+
+    assert result["status"] == "ok"
+    assert callable(heavy_mock.call_args.kwargs["ground_fn"])
+
+
+@pytest.mark.asyncio
+async def test_grounding_false_disables_the_gate() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
+        patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))) as loop_mock,
+    ):
+        result = json.loads(await tools.deep_research("What?", grounding=False))
+
+    assert result["status"] == "ok"
+    assert loop_mock.call_args.kwargs["ground_fn"] is None
+
+
+@pytest.mark.asyncio
+async def test_ground_model_routes_to_separate_model_instance() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", side_effect=[object(), object()]) as get_model,
+        patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
+        patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
+    ):
+        result = json.loads(await tools.deep_research("What?", ground_model="override"))
+
+    assert result["status"] == "ok"
+    assert [call.args[2] for call in get_model.call_args_list] == ["active", "override"]
+
+
+def test_round_progress_shows_open_question_count() -> None:
+    module = _load_tools_module()
+    event = {"round": 2, "max_rounds": 9, "thought": "t", "confidence": 0.3, "open_questions": 3}
+    assert module._format_round_progress(event, verbose=False).startswith("round 2/9 · 0.30 · 3 open · t")
+    event_clean = {"round": 2, "max_rounds": 9, "thought": "t", "confidence": 0.3, "open_questions": 0}
+    assert module._format_round_progress(event_clean, verbose=False).startswith("round 2/9 · 0.30 · t")

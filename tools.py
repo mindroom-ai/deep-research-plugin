@@ -434,7 +434,9 @@ def _format_round_progress(event: dict[str, object], *, verbose: bool) -> str:
     confidence = float(event.get("confidence") or 0)
     researcher = event.get("researcher")
     prefix = f"researcher {researcher} · " if researcher else ""
-    line = f"{prefix}round {event['round']}/{event['max_rounds']} · {confidence:.2f} · {thought}"
+    open_questions = int(event.get("open_questions") or 0)
+    open_note = f" · {open_questions} open" if open_questions else ""
+    line = f"{prefix}round {event['round']}/{event['max_rounds']} · {confidence:.2f}{open_note} · {thought}"
     if not verbose:
         return line
     queries = event.get("search_queries")
@@ -484,6 +486,8 @@ class DeepResearchTools(Toolkit):
         report_token_cap: int = DEFAULT_REPORT_TOKEN_CAP,
         parallel_researchers: int = 1,
         extract_model: str | None = None,
+        grounding: bool = True,
+        ground_model: str | None = None,
     ) -> str:
         """Run a bounded deep research loop for one question.
 
@@ -491,7 +495,10 @@ class DeepResearchTools(Toolkit):
         loops explore the question from different angles concurrently and a
         final synthesis pass integrates their cited reports (roughly N times
         the token cost). Set extract_model to route the high-volume page
-        extraction role to a cheaper model.
+        extraction role to a cheaper model. Set grounding=False to skip the
+        final grounding gate (saves one or two LLM calls on quick bounded
+        runs), and ground_model to run the grounding check on a different
+        configured model than the writer.
         """
         normalized_question = question.strip() if isinstance(question, str) else ""
         if not normalized_question:
@@ -531,8 +538,10 @@ class DeepResearchTools(Toolkit):
                 if isinstance(verbosity, str) and verbosity in {"silent", "progress", "verbose"}
                 else "progress"
             )
+            grounding = grounding if isinstance(grounding, bool) else True
             model_name = _resolve_model_name(context, model)
             extract_model_name = _resolve_model_name(context, extract_model) if extract_model else model_name
+            ground_model_name = _resolve_model_name(context, ground_model) if ground_model else model_name
             execution_identity = build_execution_identity_from_runtime_context(context)
             live_model = get_model_instance(
                 context.config,
@@ -547,6 +556,16 @@ class DeepResearchTools(Toolkit):
                     context.config,
                     context.runtime_paths,
                     extract_model_name,
+                    execution_identity=execution_identity,
+                )
+            )
+            ground_live_model = (
+                live_model
+                if ground_model_name == model_name
+                else get_model_instance(
+                    context.config,
+                    context.runtime_paths,
+                    ground_model_name,
                     execution_identity=execution_identity,
                 )
             )
@@ -663,7 +682,7 @@ class DeepResearchTools(Toolkit):
         async def ground_fn(prompt: str) -> object:
             counters["ground"] += 1
             agent = Agent(
-                model=live_model,
+                model=ground_live_model,
                 output_schema=GroundingCheck,
                 telemetry=False,
                 markdown=False,
@@ -728,7 +747,7 @@ class DeepResearchTools(Toolkit):
                 "max_reads_per_round": max_reads_per_round,
                 "report_char_cap": report_token_cap * 4,
                 "search_channels": prompt_channels,
-                "ground_fn": ground_fn,
+                "ground_fn": ground_fn if grounding else None,
             }
             if parallel_researchers > 1:
                 result = await run_heavy_research_loop(researchers=parallel_researchers, **loop_kwargs)

@@ -2122,7 +2122,13 @@ async def test_grounding_gate_regenerates_flagged_report() -> None:
     assert result.report.startswith("revised claim [1]")
     assert len(synthesize_prompts) == 2
     assert "not in evidence" in synthesize_prompts[1]
-    assert any("grounding check flagged 1 unsupported claims" in warning for warning in result.warnings)
+    # The regeneration sees the draft it must fix, and the run's stats
+    # record what the gate did.
+    assert "Your previous draft:" in synthesize_prompts[1]
+    assert "overstated claim [1]" in synthesize_prompts[1]
+    assert result.stats["grounding_issues"] == 1
+    assert result.stats["grounding_regenerations"] == 1
+    assert any("grounding check flagged 1 unsupported claim;" in warning for warning in result.warnings)
     # The grounding prompt sees the report body and the evidence context.
     assert "overstated claim [1]" in ground_prompts[0]
     assert "fact A" in ground_prompts[0]
@@ -2653,3 +2659,63 @@ def test_reasoner_prompt_lists_search_channels() -> None:
         budget_left="1 round",
     )
     assert "- scholar: academic and scholarly sources" in default_prompt
+
+
+@pytest.mark.asyncio
+async def test_grounding_gate_skipped_near_deadline_appends_warning() -> None:
+    async def ground(_prompt: str) -> Any:
+        raise AssertionError("grounding must not run when the budget is nearly spent")
+
+    async def synthesize(_prompt: str) -> str:
+        raise AssertionError("regeneration must not run either")
+
+    warnings: list[str] = []
+    record = loop.SourceRecord(id=1, url="https://example.com/a", title="A")
+    report = await loop._apply_grounding_gate(
+        final_report="claim [1]\n\n## Sources\n[1] A - https://example.com/a",
+        final_prompt="prompt",
+        question="q",
+        grounding_context="evidence",
+        sources=[record.model_dump()],
+        sources_by_url={record.url: record},
+        ground_fn=ground,
+        synthesize_fn=synthesize,
+        budget=loop._WallClockBudget(start=0.0, seconds=50, clock=lambda: 10.0),
+        warnings=warnings,
+    )
+
+    assert report.startswith("claim [1]")
+    assert warnings == ["grounding check skipped: wall clock nearly spent"]
+
+
+@pytest.mark.asyncio
+async def test_finish_with_open_questions_is_counted_and_emitted() -> None:
+    events: list[dict[str, Any]] = []
+
+    async def emit(event: dict[str, Any]) -> None:
+        events.append(event)
+
+    async def reason(_prompt: str) -> Any:
+        return loop.ResearchStep(
+            thought="bailing with questions still open",
+            updated_report="partial",
+            open_questions=["what about the follow-up?"],
+            confidence=0.4,
+            next_action="finish",
+        )
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=3,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=_empty_search,
+        read_fn=_unused_read,
+        synthesize_fn=_synthesize,
+        emit_fn=emit,
+    )
+
+    assert result.stopped_reason == "model_finished"
+    assert result.stats["finished_with_open_questions"] == 1
+    assert events[0]["open_questions"] == 1
