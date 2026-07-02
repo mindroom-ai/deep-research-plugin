@@ -149,7 +149,7 @@ def _parse_search_results(raw: str) -> list[SearchHit]:
         return []
     error = parsed.get("error")
     if error or str(parsed.get("status") or "").lower() == "error":
-        raise RuntimeError(str(error or parsed.get("message") or "search failed"))
+        raise RuntimeError(str(error or parsed.get("message") or parsed.get("description") or "search failed"))
     rows: list[object] = []
     for key in ("organic", "news", "articles", "scholar", "results", "sources", "items"):
         value = parsed.get(key)
@@ -202,8 +202,19 @@ def _accepts_keyword(function: Callable[..., object], name: str) -> bool:
 async def _call_search_function(toolkit: object, function_name: str, query: str, *, num_results: int) -> str:
     entrypoint = _tool_function_entrypoint(toolkit, function_name)
     kwargs: dict[str, object] = {"num_results": num_results} if _accepts_keyword(entrypoint, "num_results") else {}
-    raw = await asyncio.to_thread(entrypoint, query, **kwargs)
+    if inspect.iscoroutinefunction(entrypoint):
+        raw = await entrypoint(query, **kwargs)
+    else:
+        raw = await asyncio.to_thread(entrypoint, query, **kwargs)
+        if inspect.isawaitable(raw):
+            raw = await raw
     return raw if isinstance(raw, str) else str(raw)
+
+
+def _tool_entry_field(entry: object, field: str) -> object:
+    if isinstance(entry, dict):
+        return entry.get(field)
+    return getattr(entry, field, None)
 
 
 def _authored_tool_overrides(context: object, tool_name: str) -> dict[str, object]:
@@ -211,8 +222,8 @@ def _authored_tool_overrides(context: object, tool_name: str) -> dict[str, objec
     agents = getattr(getattr(context, "config", None), "agents", None)
     agent = agents.get(getattr(context, "agent_name", None)) if isinstance(agents, dict) else None
     for entry in getattr(agent, "tools", None) or []:
-        if getattr(entry, "name", None) == tool_name:
-            overrides = getattr(entry, "overrides", None)
+        if _tool_entry_field(entry, "name") == tool_name:
+            overrides = _tool_entry_field(entry, "overrides")
             return dict(overrides) if isinstance(overrides, dict) else {}
     return {}
 
