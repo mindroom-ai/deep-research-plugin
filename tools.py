@@ -428,10 +428,15 @@ def _caller_worker_target(context: object) -> object | None:
 
 
 def _worker_shared_services(context: object, worker_target: object | None) -> frozenset[str] | None:
-    if worker_target is None or getattr(worker_target, "worker_scope", None) is None:
+    """Fail-soft like _caller_worker_target: None means the previous unscoped behavior."""
+    try:
+        if worker_target is None or getattr(worker_target, "worker_scope", None) is None:
+            return None
+        grantable = getattr(context.config, "get_worker_grantable_credentials", None)
+        return grantable() if callable(grantable) else None
+    except Exception as exc:
+        LOGGER.warning("deep_research_shared_services_resolution_failed", error=str(exc))
         return None
-    grantable = getattr(context.config, "get_worker_grantable_credentials", None)
-    return grantable() if callable(grantable) else None
 
 
 def _authored_tool_overrides(context: object, tool_name: str) -> dict[str, object]:
