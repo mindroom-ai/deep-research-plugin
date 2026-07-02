@@ -1963,6 +1963,291 @@ async def test_heavy_mode_assigns_distinct_angles_to_researchers() -> None:
     assert any(loop.RESEARCH_ANGLES[1] in prompt for prompt in prompts)
 
 
+def _step(**overrides: Any) -> Any:
+    base: dict[str, Any] = {
+        "thought": "t",
+        "updated_report": "r",
+        "open_questions": [],
+        "confidence": 0.1,
+        "next_action": "finish",
+    }
+    base.update(overrides)
+    return loop.ResearchStep(**base)
+
+
+@pytest.mark.asyncio
+async def test_open_questions_feed_back_into_next_reasoner_prompt() -> None:
+    reason_calls = 0
+    prompts: list[str] = []
+
+    async def reason(prompt: str) -> Any:
+        nonlocal reason_calls
+        reason_calls += 1
+        prompts.append(prompt)
+        if reason_calls == 1:
+            return _step(
+                next_action="search",
+                search_queries=[loop.SearchQuery(query="q1")],
+                open_questions=["What is the launch date?"],
+            )
+        return _step()
+
+    async def search(_query: Any, _limit: int) -> list[Any]:
+        return [{"url": "https://example.com/a", "title": "A", "snippet": "s"}]
+
+    await loop.run_research_loop(
+        question="q",
+        max_rounds=2,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=search,
+        read_fn=_unused_read,
+        synthesize_fn=_synthesize,
+    )
+
+    assert "What is the launch date?" in prompts[1]
+    assert "(none)" in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_confident_stop_requires_no_open_questions() -> None:
+    reason_calls = 0
+
+    async def reason(_prompt: str) -> Any:
+        nonlocal reason_calls
+        reason_calls += 1
+        if reason_calls == 1:
+            return _step(confidence=0.4, next_action="read", read_urls=["https://example.com/a"])
+        if reason_calls == 2:
+            return _step(
+                confidence=0.9,
+                next_action="search",
+                search_queries=[loop.SearchQuery(query="follow up")],
+                open_questions=["Still unresolved"],
+            )
+        return _step(confidence=0.9, next_action="search")
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=10,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=lambda _prompt: _await(loop.Extraction(facts=["fact A"], relevant=True)),
+        search_fn=_empty_search,
+        read_fn=lambda url: _await(loop.Page(url=url, title="A", text="text")),
+        synthesize_fn=lambda _prompt: _await("final [1]"),
+    )
+
+    # Round 2 had 0.9 confidence and a source but an open question -> no stop;
+    # round 3 cleared the open questions -> confident stop.
+    assert result.stopped_reason == "confident"
+    assert result.rounds_used == 3
+
+
+@pytest.mark.asyncio
+async def test_unresolved_open_questions_reach_synthesis_workspace() -> None:
+    synthesize_prompts: list[str] = []
+
+    async def reason(_prompt: str) -> Any:
+        return _step(open_questions=["Mystery question about pricing"])
+
+    async def synthesize(prompt: str) -> str:
+        synthesize_prompts.append(prompt)
+        return "final report"
+
+    await loop.run_research_loop(
+        question="q",
+        max_rounds=1,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=_empty_search,
+        read_fn=_unused_read,
+        synthesize_fn=synthesize,
+    )
+
+    assert "Unresolved questions" in synthesize_prompts[0]
+    assert "Mystery question about pricing" in synthesize_prompts[0]
+
+
+def _reader_with_source() -> tuple[Any, Any]:
+    async def reason(_prompt: str) -> Any:
+        return _step(next_action="read", read_urls=["https://example.com/a"], confidence=0.1)
+
+    reason_calls = {"n": 0}
+
+    async def reason_then_finish(prompt: str) -> Any:
+        reason_calls["n"] += 1
+        if reason_calls["n"] == 1:
+            return await reason(prompt)
+        return _step()
+
+    async def extract(_prompt: str) -> Any:
+        return loop.Extraction(facts=["fact A"], relevant=True)
+
+    return reason_then_finish, extract
+
+
+@pytest.mark.asyncio
+async def test_grounding_gate_regenerates_flagged_report() -> None:
+    reason_fn, extract_fn = _reader_with_source()
+    synthesize_prompts: list[str] = []
+    ground_prompts: list[str] = []
+
+    async def synthesize(prompt: str) -> str:
+        synthesize_prompts.append(prompt)
+        if "grounding check found claims" in prompt:
+            return "revised claim [1]"
+        return "overstated claim [1]"
+
+    async def ground(prompt: str) -> Any:
+        ground_prompts.append(prompt)
+        return loop.GroundingCheck(
+            issues=[loop.GroundingIssue(claim="overstated claim", source_id=1, reason="not in evidence")],
+        )
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=2,
+        wall_clock_seconds=600,
+        reason_fn=reason_fn,
+        extract_fn=extract_fn,
+        search_fn=_empty_search,
+        read_fn=lambda url: _await(loop.Page(url=url, title="A", text="text")),
+        synthesize_fn=synthesize,
+        ground_fn=ground,
+    )
+
+    assert result.report.startswith("revised claim [1]")
+    assert len(synthesize_prompts) == 2
+    assert "not in evidence" in synthesize_prompts[1]
+    assert any("grounding check flagged 1 unsupported claims" in warning for warning in result.warnings)
+    # The grounding prompt sees the report body and the evidence context.
+    assert "overstated claim [1]" in ground_prompts[0]
+    assert "fact A" in ground_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_grounding_gate_passes_clean_report_untouched() -> None:
+    reason_fn, extract_fn = _reader_with_source()
+    synthesize_calls = 0
+
+    async def synthesize(_prompt: str) -> str:
+        nonlocal synthesize_calls
+        synthesize_calls += 1
+        return "grounded claim [1]"
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=2,
+        wall_clock_seconds=600,
+        reason_fn=reason_fn,
+        extract_fn=extract_fn,
+        search_fn=_empty_search,
+        read_fn=lambda url: _await(loop.Page(url=url, title="A", text="text")),
+        synthesize_fn=synthesize,
+        ground_fn=lambda _prompt: _await(loop.GroundingCheck()),
+    )
+
+    assert result.report.startswith("grounded claim [1]")
+    assert synthesize_calls == 1
+    assert result.warnings == []
+
+
+@pytest.mark.asyncio
+async def test_grounding_gate_soft_fails_on_unparseable_verdict() -> None:
+    reason_fn, extract_fn = _reader_with_source()
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=2,
+        wall_clock_seconds=600,
+        reason_fn=reason_fn,
+        extract_fn=extract_fn,
+        search_fn=_empty_search,
+        read_fn=lambda url: _await(loop.Page(url=url, title="A", text="text")),
+        synthesize_fn=lambda _prompt: _await("claim [1]"),
+        ground_fn=lambda _prompt: _await("{not json"),
+    )
+
+    # Unparseable verdict counts as a pass; the report ships with a warning.
+    assert result.report.startswith("claim [1]")
+    assert any("grounding check structured output failed" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_grounding_regeneration_that_loses_citations_is_discarded() -> None:
+    reason_fn, extract_fn = _reader_with_source()
+
+    async def synthesize(prompt: str) -> str:
+        if "grounding check found claims" in prompt:
+            return "rewritten without any citations"
+        return "flagged claim [1]"
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=2,
+        wall_clock_seconds=600,
+        reason_fn=reason_fn,
+        extract_fn=extract_fn,
+        search_fn=_empty_search,
+        read_fn=lambda url: _await(loop.Page(url=url, title="A", text="text")),
+        synthesize_fn=synthesize,
+        ground_fn=lambda _prompt: _await(
+            loop.GroundingCheck(issues=[loop.GroundingIssue(claim="flagged claim")]),
+        ),
+    )
+
+    assert result.report.startswith("flagged claim [1]")
+    assert any("lost its citations" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_heavy_mode_grounds_only_the_integrated_report() -> None:
+    ground_calls = 0
+
+    async def reason(_prompt: str) -> Any:
+        return _step(next_action="read", read_urls=["https://example.com/a"], confidence=0.1)
+
+    reason_state = {"n": 0}
+
+    async def reason_two_rounds(prompt: str) -> Any:
+        reason_state["n"] += 1
+        if "read" not in prompt or reason_state["n"] % 2 == 1:
+            return await reason(prompt)
+        return _step()
+
+    async def synthesize(prompt: str) -> str:
+        if "Researcher 1 report" in prompt:
+            if "grounding check found claims" in prompt:
+                return "revised heavy [1]"
+            return "heavy claim [1]"
+        return "single [1]"
+
+    async def ground(_prompt: str) -> Any:
+        nonlocal ground_calls
+        ground_calls += 1
+        return loop.GroundingCheck(issues=[loop.GroundingIssue(claim="heavy claim", source_id=1)])
+
+    result = await loop.run_heavy_research_loop(
+        question="q",
+        researchers=2,
+        max_rounds=2,
+        wall_clock_seconds=600,
+        reason_fn=reason_two_rounds,
+        extract_fn=lambda _prompt: _await(loop.Extraction(facts=["fact A"], relevant=True)),
+        search_fn=_empty_search,
+        read_fn=lambda url: _await(loop.Page(url=url, title="A", text="text")),
+        synthesize_fn=synthesize,
+        ground_fn=ground,
+    )
+
+    # Researchers do not run the gate; only the integrated report does.
+    assert ground_calls == 1
+    assert result.report.startswith("revised heavy [1]")
+
+
 async def _await(value: Any) -> Any:
     return value
 

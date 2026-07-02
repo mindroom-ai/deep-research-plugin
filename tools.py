@@ -42,6 +42,7 @@ from .loop import (
     RESULTS_PER_QUERY_CAP,
     WALL_CLOCK_SECONDS_CAP,
     Extraction,
+    GroundingCheck,
     Page,
     ResearchStep,
     SearchHit,
@@ -624,7 +625,7 @@ class DeepResearchTools(Toolkit):
             LOGGER.warning("deep_research_website_unavailable", error=str(exc))
             return _error(f"Website reader is unavailable: {exc}")
 
-        counters = {"reason": 0, "extract": 0, "synthesize": 0}
+        counters = {"reason": 0, "extract": 0, "synthesize": 0, "ground": 0}
         wrapper_start = time.monotonic()
 
         def remaining_wall_clock_seconds() -> float:
@@ -658,6 +659,17 @@ class DeepResearchTools(Toolkit):
             response = await agent.arun(prompt, session_id=_session_id(context, "synthesize", counters["synthesize"]))
             content = _content_from_response(response)
             return content if isinstance(content, str) else str(content)
+
+        async def ground_fn(prompt: str) -> object:
+            counters["ground"] += 1
+            agent = Agent(
+                model=live_model,
+                output_schema=GroundingCheck,
+                telemetry=False,
+                markdown=False,
+            )
+            response = await agent.arun(prompt, session_id=_session_id(context, "ground", counters["ground"]))
+            return _content_from_response(response)
 
         async def search_fn(query: SearchQuery, limit: int) -> list[SearchHit]:
             channel = channels.get(query.kind)
@@ -716,6 +728,7 @@ class DeepResearchTools(Toolkit):
                 "max_reads_per_round": max_reads_per_round,
                 "report_char_cap": report_token_cap * 4,
                 "search_channels": prompt_channels,
+                "ground_fn": ground_fn,
             }
             if parallel_researchers > 1:
                 result = await run_heavy_research_loop(researchers=parallel_researchers, **loop_kwargs)

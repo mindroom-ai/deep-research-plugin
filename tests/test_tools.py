@@ -362,6 +362,24 @@ def test_round_progress_includes_researcher_prefix_in_heavy_mode() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ground_fn_is_wired_into_loop_kwargs() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
+        patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))) as loop_mock,
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+    assert callable(loop_mock.call_args.kwargs["ground_fn"])
+
+
+@pytest.mark.asyncio
 async def test_verbosity_silent_sends_no_progress_messages() -> None:
     module = _load_tools_module()
     tools = module.DeepResearchTools()
