@@ -7,7 +7,7 @@
 
 A long-horizon web-research tool for [MindRoom](https://github.com/mindroom-ai/mindroom) agents, powered by the agent's own configured model.
 
-Ask one hard question and get back a cited report. `deep_research` runs a bounded, multi-round research loop — search, read, extract, decide, repeat — that compresses what it has learned into a rolling report between rounds so it can dig deep without blowing the context window. It ports the IterResearch loop pattern (from Alibaba's Tongyi DeepResearch) onto MindRoom's existing model and tools instead of wrapping a dedicated research model, so it runs on whatever model the calling agent already uses (e.g. Vertex Claude) with no GPU and no extra services.
+Ask one hard question and get back a cited report. `deep_research` runs a bounded, multi-round research loop — search, read, extract, decide, repeat — that compresses what it has learned into a rolling report between rounds so it can dig deep without blowing the context window. The core loop and heavy mode port the IterResearch and Research-Synthesis patterns from [Alibaba's Tongyi DeepResearch](https://github.com/Alibaba-NLP/DeepResearch); the quality and robustness layers — the grounding gate, evidence-gated stopping, fail-soft degradation at every step, and role-based model routing — adapt techniques from [Lunon Deep Research](https://github.com/LunonAI/lunon-deep-research) (#1 on DeepResearch Bench). Both are rebuilt onto MindRoom's existing model and tools instead of wrapping a dedicated research model, so it runs on whatever model the calling agent already uses (e.g. Vertex Claude) with no GPU and no extra services.
 
 ## Features
 
@@ -54,8 +54,8 @@ The returned envelope includes `status`, `report` (Markdown with `[n]` citations
 Parameters:
 
 - `question` — the research question (required, non-empty).
-- `max_rounds` — soft round budget (default `100`, mirroring the original repository's default LLM-call budget as this loop's round cap).
-- `wall_clock_seconds` — hard time budget (default `9000`, matching the original repository's 150-minute timeout).
+- `max_rounds` — soft round budget (default `100`, mirroring Tongyi DeepResearch's default LLM-call budget as this loop's round cap).
+- `wall_clock_seconds` — hard time budget (default `9000`, matching Tongyi DeepResearch's 150-minute timeout).
 - `model` — override the model name; defaults to the caller's active model.
 - `verbosity` — `"progress"` streams per-round updates into the thread; `"silent"` returns only the final report.
 - `max_queries_per_round` — maximum planned search queries per search round (default `5`, capped at `10`).
@@ -152,3 +152,12 @@ agents:
    ```
 3. Add `deep_research` to the agent's tools list.
 4. Restart MindRoom.
+
+## Prior Art
+
+The design borrows deliberately from two open research systems:
+
+- [Tongyi DeepResearch](https://github.com/Alibaba-NLP/DeepResearch) (Alibaba) — the IterResearch round structure (plan → act → compress into a rolling workspace), the round/wall-clock budgets, and heavy mode's Research-Synthesis pattern of parallel researchers integrated by one synthesis pass.
+- [Lunon Deep Research](https://github.com/LunonAI/lunon-deep-research) (Lunon) — the layered fail-soft philosophy (every enhancement step degrades to the previous good state instead of failing the run), the grounding gate that verifies cited claims against evidence and regenerates once, verified-not-trusted stopping, snippet-level fallback evidence, and multi-model role routing.
+
+Techniques from both were rescaled to fit a single chat-invoked tool; their heavier machinery (dedicated research models, per-section writing pipelines, benchmark-specific post-processing) was intentionally left out.
