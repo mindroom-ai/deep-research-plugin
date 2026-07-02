@@ -27,7 +27,9 @@ Ask one hard question and get back a cited report. `deep_research` runs a bounde
 - In heavy mode, page fetches and extractions are shared across researchers, so parallel researchers converging on the same URL cost one fetch and one extraction instead of N
 - A page that cannot be read (e.g. a 403 anti-bot response) degrades to its search snippet as a clearly-labeled unvetted source instead of vanishing from the evidence pool
 - The reasoner can promote snippet-backed candidates into citable unvetted sources (`cite_snippet_urls`) without spending a page read — corroborating coverage the reasoner relies on no longer ends up uncited — and is nudged to spend its reads on primary sources
-- Confidence-based stopping is evidence-gated (requires at least one registered source), plus no-progress stopping
+- Confidence-based stopping is evidence-gated (requires at least one registered source and no open questions the reasoner itself still flags), plus no-progress stopping
+- The reasoner's open questions feed back into each round and any still unresolved at the end are surfaced in the final report as explicit unknowns
+- A grounding gate verifies the final report's cited claims against the evidence it was written from and regenerates once on failure — fail-soft in every direction (skipped near the deadline, unparseable verdict passes, a regeneration that loses citations is discarded)
 - A transiently failing reasoner call skips the round instead of ending the run
 - Streams per-round progress into the thread, or runs quietly on request
 - Pure plugin: no core changes and no plugin-local dependencies
