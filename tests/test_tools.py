@@ -1391,3 +1391,72 @@ def test_result_text_unwraps_string_and_block_list_content_conservatively() -> N
     assert module._result_text(StrContent()) == '{"results": []}'
     assert module._result_text(BlockContent()) == '{"documents": []}\nsecond block'
     assert module._result_text(UnrelatedContent()) == "plain repr"
+
+
+def test_parse_search_channels_accepts_json_object_strings() -> None:
+    module = _load_tools_module()
+
+    channels = module._parse_search_channels(
+        [
+            '{"name": "wiki", "tool": "mcp_wiki", "function": "wiki_call_tool", "description": "Internal wiki", '
+            '"arguments": {"tool_name": "list_documents", "arguments": {"query": "{query}", "limit": "{num_results}"}}}',
+            '{"name": "chat", "tool": "chat_tool", "function": "search_messages"}',
+        ],
+    )
+
+    assert [channel["name"] for channel in channels] == ["wiki", "chat"]
+    assert channels[0]["tool"] == "mcp_wiki"
+    assert channels[0]["function"] == "wiki_call_tool"
+    assert channels[0]["description"] == "Internal wiki"
+    assert channels[0]["arguments"] == {
+        "tool_name": "list_documents",
+        "arguments": {"query": "{query}", "limit": "{num_results}"},
+    }
+    assert channels[1]["tool"] == "chat_tool"
+    assert channels[1]["function"] == "search_messages"
+    assert channels[1]["arguments"] is None
+
+
+def test_parse_search_channels_reparses_comma_joined_runtime_string() -> None:
+    module = _load_tools_module()
+
+    # MindRoom's per-agent override path joins string[] values with ", "
+    # before they reach the constructor; commas inside quoted JSON values
+    # must not break the re-parse.
+    joined = ", ".join(
+        [
+            '{"name": "wiki", "tool": "mcp_wiki", "function": "wiki_call_tool", "description": "Runbooks, docs, and more"}',
+            '{"name": "chat", "tool": "chat_tool", "function": "search_messages"}',
+        ],
+    )
+
+    channels = module._parse_search_channels(joined)
+
+    assert [channel["name"] for channel in channels] == ["wiki", "chat"]
+    assert channels[0]["description"] == "Runbooks, docs, and more"
+
+
+def test_parse_search_channels_drops_malformed_json_strings_without_crashing() -> None:
+    module = _load_tools_module()
+
+    channels = module._parse_search_channels(['{"name": "broken"', "chat=chat_tool.search|Chat"])
+
+    assert [channel["name"] for channel in channels] == ["chat"]
+
+
+def test_parse_search_channels_splits_comma_joined_compact_strings() -> None:
+    module = _load_tools_module()
+
+    joined = "wiki=wiki_tool.search_documents|Runbooks, docs, and more, chat=chat_tool.search_messages|Team chat"
+
+    channels = module._parse_search_channels(joined)
+
+    assert [channel["name"] for channel in channels] == ["wiki", "chat"]
+    assert channels[0]["description"] == "Runbooks, docs, and more"
+    assert channels[1]["description"] == "Team chat"
+
+
+def test_parse_search_channels_drops_standalone_malformed_json_string() -> None:
+    module = _load_tools_module()
+
+    assert module._parse_search_channels('{"name": "broken"') == []

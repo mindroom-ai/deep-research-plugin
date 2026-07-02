@@ -59,19 +59,59 @@ HIT_SNIPPET_CHAR_LIMIT = 500
 _PLACEHOLDER_RE = re.compile(r"\{query\}|\{num_results\}")
 
 
+def _coerce_channel_entries(raw: object) -> list[object]:
+    """Expand raw channel config into a list of entry objects.
+
+    MindRoom validates per-agent string[] overrides as lists of strings and
+    hands them to the constructor comma-joined into ONE string, so channels
+    with structured fields (arguments templates) must be authored as JSON
+    object strings. Wrapping the joined form in brackets re-parses it as a
+    JSON array regardless of commas inside quoted values; individual JSON
+    object strings inside lists are decoded the same way.
+    """
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        if text.startswith("{"):
+            try:
+                # A successful parse of "[...]" is always a list.
+                return json.loads(f"[{text}]")
+            except json.JSONDecodeError:
+                pass
+        # Comma-joined compact entries: split only where the next segment
+        # looks like a compact channel ("name="), so commas inside
+        # descriptions do not split.
+        return re.split(r", (?=[A-Za-z0-9_-]+=)", text)
+    if not isinstance(raw, list):
+        return []
+    entries: list[object] = []
+    for entry in raw:
+        if isinstance(entry, str) and entry.lstrip().startswith("{"):
+            try:
+                entries.append(json.loads(entry))
+                continue
+            except json.JSONDecodeError:
+                pass
+        entries.append(entry)
+    return entries
+
+
 def _parse_search_channels(raw: object) -> list[dict[str, object]]:
     """Normalize authored search_channels config into channel dicts.
 
     Accepts structured entries ({name, tool, function, description}, plus an
     optional arguments template with {query}/{num_results} placeholders for
-    functions that take structured kwargs, e.g. MCP tools) and the compact
-    string form "name=tool.function|description" (for UIs that only take
-    strings; no arguments template). Invalid entries and names that shadow
-    the built-in web/news/scholar channels are dropped with a warning.
+    functions that take structured kwargs, e.g. MCP tools), JSON object
+    strings of the same shape (required for MindRoom per-agent overrides,
+    whose string[] fields must be lists of strings), and the compact string
+    form "name=tool.function|description" (no arguments template). Invalid
+    entries and names that shadow the built-in web/news/scholar channels are
+    dropped with a warning.
     """
     channels: list[dict[str, object]] = []
     seen_names: set[str] = set()
-    for entry in raw if isinstance(raw, list) else []:
+    for entry in _coerce_channel_entries(raw):
         arguments: dict[str, object] | None = None
         if isinstance(entry, dict):
             name = str(entry.get("name") or "").strip().lower()
