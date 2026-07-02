@@ -2303,3 +2303,40 @@ async def test_snippetless_stored_variant_does_not_shadow_canonical_equivalent()
     assert result.stats["snippet_sources_registered"] == 1
     assert [source["url"] for source in result.sources] == ["https://primary.example/press"]
     assert result.sources[0]["snippet"] == "The launch happened."
+
+
+@pytest.mark.asyncio
+async def test_failed_read_of_url_variant_falls_back_to_stored_candidate_snippet() -> None:
+    async def reason(_prompt: str) -> Any:
+        return loop.ResearchStep(
+            thought="read the trailing-slash variant of the discovered page",
+            updated_report="answer [1]",
+            open_questions=[],
+            confidence=0.5,
+            next_action="read",
+            read_urls=["https://primary.example/press/"],
+        )
+
+    async def search(_query: Any, _limit: int) -> list[Any]:
+        return [{"url": "https://primary.example/press", "title": "Primary PR", "snippet": "The launch happened."}]
+
+    async def read(_url: str) -> Any:
+        raise RuntimeError("403 blocked")
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=2,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=search,
+        read_fn=read,
+        synthesize_fn=_synthesize,
+    )
+
+    # The variant read failed, but the fallback matched the stored candidate
+    # and registered its snippet under the stored URL.
+    assert result.stats["read_snippet_fallbacks"] == 1
+    assert [source["url"] for source in result.sources] == ["https://primary.example/press"]
+    assert result.sources[0]["title"] == "Primary PR"
+    assert result.sources[0]["snippet"] == "The launch happened."

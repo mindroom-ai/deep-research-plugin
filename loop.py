@@ -907,14 +907,20 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
                 # into this worker's own read_results slot keeps the fallback
                 # on the same merge path as a successful read — if the batch
                 # structure ever changes, this write must move with it.
-                _, snippet = candidate_meta.get(url, ("", ""))
-                snippet = snippet.strip()
+                # Variant-tolerant matching so a read of e.g. the
+                # trailing-slash form still finds the stored candidate; the
+                # page keeps the matched URL so registration lands on the
+                # same key as snippet citations of that candidate.
+                match = _match_candidate(candidate_meta, url)
+                if match is None:
+                    return
+                matched_url, (matched_title, snippet) = match
                 if not snippet:
                     return
                 stats["read_snippet_fallbacks"] += 1
                 read_results[index] = (
                     url,
-                    Page(url=url, title="", text=""),
+                    Page(url=matched_url, title=matched_title, text=""),
                     Extraction(facts=[f"Unvetted search snippet: {snippet}"], relevant=True),
                 )
 
@@ -995,7 +1001,8 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
             considered_urls.add(url)
             if not extraction.relevant:
                 continue
-            candidate_title, candidate_snippet = candidate_meta.get(url, ("", ""))
+            candidate_match = _match_candidate(candidate_meta, url)
+            candidate_title, candidate_snippet = candidate_match[1] if candidate_match else ("", "")
             title = page.title.strip()
             if not title or title == page.url:
                 title = candidate_title
