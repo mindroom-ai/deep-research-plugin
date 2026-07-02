@@ -2367,4 +2367,4 @@ def test_reasoner_prompt_lists_search_channels() -> None:
         sources=[],
         budget_left="1 round",
     )
-    assert "- scholar: academic and scholarly search" in default_prompt
+    assert "- scholar: academic and scholarly sources" in default_prompt

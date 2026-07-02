@@ -28,6 +28,7 @@ from mindroom.tool_system.runtime_context import (
     resolve_tool_runtime_hook_bindings,
 )
 
+from .prompts import BASE_CHANNEL_DESCRIPTIONS
 from .loop import (
     MAX_ROUNDS_CAP,
     MAX_QUERIES_PER_ROUND,
@@ -53,11 +54,6 @@ LOGGER = get_logger(__name__)
 TOOL_NAME = "deep_research"
 DEFAULT_SEARCH_TOOL = "serper"
 SERPER_SEARCH_FUNCTIONS = {"web": "search_web", "news": "search_news", "scholar": "search_scholar"}
-BASE_CHANNEL_DESCRIPTIONS = {
-    "web": "general public web search",
-    "news": "recent news coverage",
-    "scholar": "academic and scholarly sources",
-}
 HIT_SNIPPET_CHAR_LIMIT = 500
 
 
@@ -104,6 +100,8 @@ def _parse_search_channels(raw: object) -> list[dict[str, str]]:
             },
         )
     return channels
+
+
 DEFAULT_MAX_ROUNDS = MAX_ROUNDS_CAP
 DEFAULT_WALL_CLOCK_SECONDS = WALL_CLOCK_SECONDS_CAP
 DEFAULT_MAX_QUERIES_PER_ROUND = MAX_QUERIES_PER_ROUND
@@ -191,6 +189,15 @@ def _extract_text_from_website_payload(payload: str) -> tuple[str, str]:
     return title, "\n\n".join(chunks)
 
 
+def _first_string(row: dict[str, object], keys: tuple[str, ...]) -> str:
+    """Return the first non-empty string value among keys, skipping non-string values."""
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
 def _parse_search_results(raw: str) -> list[SearchHit]:
     try:
         parsed = json.loads(raw)
@@ -214,20 +221,12 @@ def _parse_search_results(raw: str) -> list[SearchHit]:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        url = row.get("link") or row.get("url") or row.get("uri") or row.get("permalink")
-        if not isinstance(url, str) or not url:
+        url = _first_string(row, ("link", "url", "uri", "permalink"))
+        if not url:
             continue
-        title = str(row.get("title") or row.get("name") or url)
-        snippet = str(
-            row.get("snippet")
-            or row.get("description")
-            or row.get("summary")
-            or row.get("context")
-            or row.get("text")
-            or row.get("domain")
-            or "",
-        )[:HIT_SNIPPET_CHAR_LIMIT]
-        hits.append(SearchHit(url=url, title=title, snippet=snippet))
+        title = _first_string(row, ("title", "name")) or url
+        snippet = _first_string(row, ("snippet", "description", "summary", "context", "text", "domain"))
+        hits.append(SearchHit(url=url, title=title, snippet=snippet[:HIT_SNIPPET_CHAR_LIMIT]))
     return hits
 
 

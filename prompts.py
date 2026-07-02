@@ -11,6 +11,14 @@ if TYPE_CHECKING:
 
 _PAGE_TEXT_TAG_RE = re.compile(r"<(?=/?\s*page_text)", re.IGNORECASE)
 
+# Single source of truth for the built-in channel names and the descriptions
+# the reasoner sees; tools.py reserves these names and advertises them.
+BASE_CHANNEL_DESCRIPTIONS = {
+    "web": "general public web search",
+    "news": "recent news coverage",
+    "scholar": "academic and scholarly sources",
+}
+
 
 def _neutralize_page_text_tags(page_text: str) -> str:
     """Escape page_text delimiter tags so untrusted content cannot close the data block."""
@@ -36,8 +44,8 @@ def reasoner_prompt(
     sources_text = "\n".join(f"- {item}" for item in sources) or "- (no sources yet)"
     queries_text = "\n".join(f"- {item}" for item in recent_queries) or "- (none yet)"
     fetched_text = "\n".join(f"- {item}" for item in fetched_urls) or "- (none yet)"
-    channels_text = "\n".join(f"- {name}: {description}" for name, description in search_channels) or (
-        "- web: general web search\n- news: news article search\n- scholar: academic and scholarly search"
+    channels_text = "\n".join(f"- {name}: {description}" for name, description in search_channels) or "\n".join(
+        f"- {name}: {description}" for name, description in BASE_CHANNEL_DESCRIPTIONS.items()
     )
     angle_text = f"\nYour assigned research angle (let it guide your queries and reads):\n{angle}\n" if angle else ""
     return f"""You are the planning and compression step in an iterative research loop.

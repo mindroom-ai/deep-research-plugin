@@ -1206,3 +1206,30 @@ async def test_search_channel_tools_resolve_with_agent_authored_overrides() -> N
 
     assert result["status"] == "ok"
     assert ("wiki_tool", {"collection": "engineering"}) in calls
+
+
+def test_parse_search_results_skips_non_string_values_in_key_chains() -> None:
+    module = _load_tools_module()
+
+    hits = module._parse_search_results(
+        json.dumps(
+            {
+                "results": [
+                    {
+                        "link": {"metadata": "not a url"},
+                        "url": "https://real.example/a",
+                        "title": ["not", "a", "title"],
+                        "name": "Real Title",
+                        "snippet": 42,
+                        "description": "real snippet",
+                    },
+                    {"link": {"only": "junk"}},
+                ],
+            },
+        ),
+    )
+
+    assert len(hits) == 1
+    assert hits[0].url == "https://real.example/a"
+    assert hits[0].title == "Real Title"
+    assert hits[0].snippet == "real snippet"
