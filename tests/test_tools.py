@@ -1540,3 +1540,103 @@ def test_round_progress_shows_open_question_count() -> None:
     assert module._format_round_progress(event, verbose=False).startswith("round 2/9 · 0.30 · 3 open · t")
     event_clean = {"round": 2, "max_rounds": 9, "thought": "t", "confidence": 0.3, "open_questions": 0}
     assert module._format_round_progress(event_clean, verbose=False).startswith("round 2/9 · 0.30 · t")
+
+
+@pytest.mark.asyncio
+async def test_channel_toolkits_resolve_with_callers_worker_target() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools(
+        search_tool="grounded_search",
+        search_function="search_public_web",
+        search_channels=[{"name": "wiki", "tool": "mcp_wiki", "function": "wiki_call_tool"}],
+    )
+    context = _tool_context(sender=AsyncMock())
+    context.config._agent_execution_scope = lambda _agent: "user_agent"
+    context.config.agents = {"code": SimpleNamespace(tools=[], private=SimpleNamespace(per="user_agent"))}
+    context.config.get_worker_grantable_credentials = lambda: frozenset({"google_vertex_adc"})
+    sentinel_target = SimpleNamespace(worker_scope="user_agent", worker_key="user:code:bas")
+    calls: list[tuple[str, Any, Any]] = []
+
+    class GroundedSearch:
+        def search_public_web(self, _query: str) -> str:
+            return json.dumps({"sources": []})
+
+    class McpWiki:
+        def __init__(self) -> None:
+            async def bridge(*, tool_name: str, arguments: dict[str, Any]) -> str:
+                del tool_name, arguments
+                return json.dumps({"documents": []})
+
+            self.async_functions = {"wiki_call_tool": _entrypoint(bridge)}
+
+    def tool_by_name(name: str, *_args: Any, **kwargs: Any) -> Any:
+        calls.append((name, kwargs.get("worker_target"), kwargs.get("allowed_shared_services")))
+        if name == "grounded_search":
+            return GroundedSearch()
+        if name == "mcp_wiki":
+            return McpWiki()
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    with (
+        tool_runtime_context(context),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "build_worker_target_from_runtime_env", return_value=sentinel_target) as build_target,
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+    # The MCP channel is built with the caller's worker target and grantable
+    # shared services, mirroring the agent's own toolkit build; the main
+    # search backend and website reader keep their previous unscoped build.
+    assert ("mcp_wiki", sentinel_target, frozenset({"google_vertex_adc"})) in calls
+    assert ("grounded_search", None, None) in calls
+    assert ("website", None, None) in calls
+    assert build_target.call_args.args[0] == "user_agent"
+    assert build_target.call_args.kwargs["private_agent_names"] == frozenset({"code"})
+
+
+@pytest.mark.asyncio
+async def test_worker_target_resolution_failure_degrades_to_unscoped_channels() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools(
+        search_tool="grounded_search",
+        search_function="search_public_web",
+        search_channels=[{"name": "wiki", "tool": "wiki_tool", "function": "search_documents"}],
+    )
+    calls: list[tuple[str, Any]] = []
+
+    class GroundedSearch:
+        def search_public_web(self, _query: str) -> str:
+            return json.dumps({"sources": []})
+
+    class WikiTool:
+        def search_documents(self, _query: str) -> str:
+            return json.dumps([])
+
+    def tool_by_name(name: str, *_args: Any, **kwargs: Any) -> Any:
+        calls.append((name, kwargs.get("worker_target")))
+        if name == "grounded_search":
+            return GroundedSearch()
+        if name == "wiki_tool":
+            return WikiTool()
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        # Identity building blows up: the helper must degrade to None, not fail the run.
+        patch.object(module, "build_execution_identity_from_runtime_context", side_effect=[object(), RuntimeError("no identity")]),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+    assert ("wiki_tool", None) in calls
