@@ -192,7 +192,9 @@ async def test_stops_on_wall_clock_before_reasoner_call() -> None:
         clock=_expired_after_start_clock(),
     )
 
-    assert result.stopped_reason == "wall_clock"
+    # The whole budget was gone before synthesis could run, so the fallback
+    # report is flagged as truncated rather than as an ordinary time stop.
+    assert result.stopped_reason == "synthesis_truncated"
     assert result.rounds_used == 0
     assert reason_calls == 0
 
@@ -273,7 +275,8 @@ async def test_wall_clock_deadline_wraps_awaited_operations(
         clock=_almost_expired_clock(),
     )
 
-    assert result.stopped_reason == "wall_clock"
+    expected_reason = "synthesis_truncated" if blocked_operation == "final_synthesis" else "wall_clock"
+    assert result.stopped_reason == expected_reason
     assert any(warning_fragment in warning for warning in result.warnings)
 
 
@@ -1651,6 +1654,249 @@ def test_researcher_wall_clock_scales_synthesis_reserve() -> None:
     assert loop._researcher_wall_clock(9000) == 9000 - loop.SYNTHESIS_RESERVE_SECONDS
     assert loop._researcher_wall_clock(240) == 150  # reserve shrinks to 90
     assert loop._researcher_wall_clock(60) == 60  # tiny budgets keep researchers viable
+
+
+def test_combined_stopped_reason_ranks_synthesis_truncated_last() -> None:
+    def make(reason: str) -> Any:
+        return loop.LoopResult(
+            question="q",
+            report="r",
+            sources=[],
+            sources_considered=0,
+            sources_used=0,
+            confidence=0.0,
+            rounds_used=0,
+            stopped_reason=reason,
+            elapsed_seconds=0.0,
+            warnings=[],
+        )
+
+    # A researcher whose own synthesis was truncated still feeds the heavy
+    # top-level synthesis, so a more informative reason wins the summary.
+    assert loop._combined_stopped_reason([make("synthesis_truncated"), make("confident")]) == "confident"
+    assert loop._combined_stopped_reason([make("synthesis_truncated"), make("wall_clock")]) == "wall_clock"
+    assert loop._combined_stopped_reason([make("synthesis_truncated")]) == "synthesis_truncated"
+
+
+@pytest.mark.asyncio
+async def test_shared_call_cache_dedups_and_recovers_from_failures() -> None:
+    calls = 0
+
+    async def fn(arg: str) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("boom")
+        return f"ok:{arg}:{calls}"
+
+    cache = loop._SharedCallCache(fn)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await cache("u")
+    # The failure was not cached: the next caller re-issues the call.
+    assert await cache("u") == "ok:u:2"
+    assert await cache("u") == "ok:u:2"
+    assert calls == 2
+    assert cache.hits == 1
+
+
+@pytest.mark.asyncio
+async def test_heavy_mode_shares_reads_and_extractions_across_researchers() -> None:
+    counts = {"a": 0, "b": 0}
+    read_calls = 0
+    extract_calls = 0
+
+    async def reason(prompt: str) -> Any:
+        key = "b" if "primary sources" in prompt else "a"
+        counts[key] += 1
+        if counts[key] == 1:
+            return loop.ResearchStep(
+                thought=f"read {key}",
+                updated_report=f"R-{key}",
+                open_questions=[],
+                confidence=0.1,
+                next_action="read",
+                read_urls=["https://example.com/shared"],
+            )
+        return loop.ResearchStep(
+            thought="finish",
+            updated_report=f"{key} claim [1]",
+            open_questions=[],
+            confidence=0.5,
+            next_action="finish",
+        )
+
+    async def read(url: str) -> Any:
+        nonlocal read_calls
+        read_calls += 1
+        return loop.Page(url=url, title="SHARED", text="text")
+
+    async def extract(_prompt: str) -> Any:
+        nonlocal extract_calls
+        extract_calls += 1
+        return loop.Extraction(facts=["shared fact"], relevant=True)
+
+    async def synthesize(prompt: str) -> str:
+        if "Researcher 1 report" in prompt:
+            return "integrated [1]"
+        return "single finding [1]"
+
+    result = await loop.run_heavy_research_loop(
+        question="q",
+        researchers=2,
+        max_rounds=3,
+        wall_clock_seconds=600,
+        reason_fn=reason,
+        extract_fn=extract,
+        search_fn=_empty_search,
+        read_fn=read,
+        synthesize_fn=synthesize,
+    )
+
+    # Both researchers requested the URL, but it was fetched and extracted once.
+    assert result.stats["reads"] == 2
+    assert read_calls == 1
+    assert extract_calls == 1
+    assert result.stats["cross_researcher_reads_shared"] == 1
+    assert result.stats["cross_researcher_extracts_shared"] == 1
+    assert [source["url"] for source in result.sources] == ["https://example.com/shared"]
+    assert result.report.startswith("integrated [1]")
+
+
+@pytest.mark.asyncio
+async def test_read_failure_falls_back_to_search_snippet() -> None:
+    synthesize_prompts: list[str] = []
+
+    async def search(_query: Any, _limit: int) -> list[Any]:
+        return [loop.SearchHit(url="https://example.com/blocked", title="Blocked", snippet="useful snippet")]
+
+    async def reason(prompt: str) -> Any:
+        if "Unvetted search snippet" not in prompt:
+            return loop.ResearchStep(
+                thought="read the candidate",
+                updated_report="r",
+                open_questions=[],
+                confidence=0.1,
+                next_action="read",
+                read_urls=["https://example.com/blocked"],
+            )
+        return loop.ResearchStep(
+            thought="finish",
+            updated_report="claim [1]",
+            open_questions=[],
+            confidence=0.5,
+            next_action="finish",
+        )
+
+    async def read(_url: str) -> Any:
+        raise RuntimeError("403 Forbidden")
+
+    async def extract(_prompt: str) -> Any:
+        raise AssertionError("extraction should not run for a failed read")
+
+    async def synthesize(prompt: str) -> str:
+        synthesize_prompts.append(prompt)
+        return "answer [1]"
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=3,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=extract,
+        search_fn=search,
+        read_fn=read,
+        synthesize_fn=synthesize,
+        retry_backoff_seconds=0.0,
+    )
+
+    # The blocked page degraded to its search snippet instead of vanishing.
+    assert result.stats["read_failures"] == 1
+    assert result.stats["read_snippet_fallbacks"] == 1
+    assert any("read failed for https://example.com/blocked" in warning for warning in result.warnings)
+    assert [source["url"] for source in result.sources] == ["https://example.com/blocked"]
+    assert "Unvetted search snippet: useful snippet" in synthesize_prompts[-1]
+    assert result.report.startswith("answer [1]")
+    assert result.sources_used == 1
+
+
+@pytest.mark.asyncio
+async def test_read_failure_without_snippet_registers_no_source() -> None:
+    async def reason(_prompt: str) -> Any:
+        return loop.ResearchStep(
+            thought="read a direct url",
+            updated_report="r",
+            open_questions=[],
+            confidence=0.1,
+            next_action="read",
+            read_urls=["https://example.com/direct"],
+        )
+
+    async def read(_url: str) -> Any:
+        raise RuntimeError("403 Forbidden")
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=1,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=_empty_search,
+        read_fn=read,
+        synthesize_fn=_synthesize,
+        retry_backoff_seconds=0.0,
+    )
+
+    # A reasoner-picked URL has no search snippet to fall back to.
+    assert result.stats["read_snippet_fallbacks"] == 0
+    assert result.sources == []
+
+
+def test_search_phase_seconds_scales_synthesis_reserve() -> None:
+    assert loop._search_phase_seconds(9000) == 9000 - loop.LOOP_SYNTHESIS_RESERVE_SECONDS
+    assert loop._search_phase_seconds(240) == 150  # full 90-second reserve
+    assert loop._search_phase_seconds(100) == 80  # reserve shrinks with the budget
+    assert loop._search_phase_seconds(60) == 60  # tiny budgets keep the search phase viable
+
+
+@pytest.mark.asyncio
+async def test_search_phase_deadline_leaves_reserve_for_final_synthesis() -> None:
+    synthesize_calls = 0
+
+    async def reason(_prompt: str) -> Any:
+        raise AssertionError("reasoner should not run past the search-phase deadline")
+
+    async def synthesize(_prompt: str) -> str:
+        nonlocal synthesize_calls
+        synthesize_calls += 1
+        return "final report"
+
+    calls = 0
+
+    def clock() -> float:
+        # Past the 150-second search deadline but inside the 240-second wall clock.
+        nonlocal calls
+        calls += 1
+        return 0.0 if calls == 1 else 160.0
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=10,
+        wall_clock_seconds=240,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=_empty_search,
+        read_fn=_unused_read,
+        synthesize_fn=synthesize,
+        clock=clock,
+    )
+
+    # The search phase hit its shorter deadline, but synthesis still ran
+    # inside the reserved slice instead of falling back.
+    assert result.stopped_reason == "wall_clock"
+    assert synthesize_calls == 1
+    assert result.report.startswith("final report")
+    assert any("wall clock expired during seed search" in warning for warning in result.warnings)
 
 
 @pytest.mark.asyncio
