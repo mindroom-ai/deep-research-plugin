@@ -7,7 +7,10 @@
 
 A long-horizon web-research tool for [MindRoom](https://github.com/mindroom-ai/mindroom) agents, powered by the agent's own configured model.
 
-Ask one hard question and get back a cited report. `deep_research` runs a bounded, multi-round research loop — search, read, extract, decide, repeat — that compresses what it has learned into a rolling report between rounds so it can dig deep without blowing the context window. The core loop and heavy mode port the IterResearch and Research-Synthesis patterns from [Alibaba's Tongyi DeepResearch](https://github.com/Alibaba-NLP/DeepResearch); the quality and robustness layers — the grounding gate, evidence-gated stopping, fail-soft degradation at every step, and role-based model routing — adapt techniques from [Lunon Deep Research](https://github.com/LunonAI/lunon-deep-research) (#1 on DeepResearch Bench). Both are rebuilt onto MindRoom's existing model and tools instead of wrapping a dedicated research model, so it runs on whatever model the calling agent already uses (e.g. Vertex Claude) with no GPU and no extra services.
+Ask one hard question and get back a cited report.
+`deep_research` runs a bounded, multi-round research loop — search, read, extract, decide, repeat — that compresses what it has learned into a rolling report between rounds so it can dig deep without blowing the context window.
+The core loop and heavy mode port the IterResearch and Research-Synthesis patterns from [Alibaba's Tongyi DeepResearch](https://github.com/Alibaba-NLP/DeepResearch); the quality and robustness layers — the grounding gate, evidence-gated stopping, fail-soft degradation at every step, and role-based model routing — adapt techniques from [Lunon Deep Research](https://github.com/LunonAI/lunon-deep-research) (#1 on DeepResearch Bench).
+Both are rebuilt onto MindRoom's existing model and tools instead of wrapping a dedicated research model, so it runs on whatever model the calling agent already uses (e.g. Vertex Claude) with no GPU and no extra services.
 
 ## Features
 
@@ -40,7 +43,8 @@ Ask one hard question and get back a cited report. `deep_research` runs a bounde
 2. The plugin resolves the caller's active model and builds an ephemeral, tool-less reasoning agent.
 3. Each round: the reasoner plans searches and/or page reads (both may run in the same round), which execute concurrently with retries and per-operation timeouts; extracted facts are folded into a rolling report with stable citations and banked per source.
 4. Between rounds the report is compressed (summarize-and-replace) so context stays bounded; the fact bank preserves evidence the compression drops.
-5. The loop stops on high evidence-backed confidence, on no further progress, or when the round/wall-clock budget runs out. Repeated queries and re-reads are skipped so a looping model cannot burn budget.
+5. The loop stops on high evidence-backed confidence, on no further progress, or when the round/wall-clock budget runs out.
+   Repeated queries and re-reads are skipped so a looping model cannot burn budget.
 6. A final synthesis pass sees the compressed report, the fact bank, and the source registry; the `## Sources` section is rebuilt from the registry using only citations that actually appear in the body.
 
 ## Agent Tools
@@ -49,7 +53,8 @@ Ask one hard question and get back a cited report. `deep_research` runs a bounde
 |------|---------|
 | `deep_research(question, max_rounds=100, wall_clock_seconds=9000, model=None, verbosity="progress", max_queries_per_round=5, results_per_query=10, max_reads_per_round=10, page_char_limit=150000, report_token_cap=16000, parallel_researchers=1, extract_model=None)` | Run a bounded, cited web-research loop for one question and return a JSON report envelope |
 
-The returned envelope includes `status`, `report` (Markdown with `[n]` citations), `sources`, `confidence`, `rounds_used`, `stopped_reason`, `elapsed_seconds`, any `warnings`, and `stats` (counts of searches, reads, extractions, retries skipped as duplicates, and failures). `stopped_reason` is one of `confident`, `model_finished`, `no_progress`, `max_rounds`, `wall_clock`, or `synthesis_truncated` — only the last one means the final report itself was cut short; every other reason still ends with a fully synthesized report.
+The returned envelope includes `status`, `report` (Markdown with `[n]` citations), `sources`, `confidence`, `rounds_used`, `stopped_reason`, `elapsed_seconds`, any `warnings`, and `stats` (counts of searches, reads, extractions, retries skipped as duplicates, and failures).
+`stopped_reason` is one of `confident`, `model_finished`, `no_progress`, `max_rounds`, `wall_clock`, or `synthesis_truncated` — only the last one means the final report itself was cut short; every other reason still ends with a fully synthesized report.
 
 Parameters:
 
@@ -68,11 +73,13 @@ Parameters:
 
 ## Configuration
 
-`deep_research` uses whatever model the calling agent is configured with, and reuses a MindRoom search tool plus the native website reader. By default it uses the built-in Serper tool — make sure it has an API key configured before enabling this plugin.
+`deep_research` uses whatever model the calling agent is configured with, and reuses a MindRoom search tool plus the native website reader.
+By default it uses the built-in Serper tool — make sure it has an API key configured before enabling this plugin.
 
 ### Custom search backends
 
-Any registered MindRoom tool (built-in or from another plugin) can serve as the search backend. Configure it on the tool entry:
+Any registered MindRoom tool (built-in or from another plugin) can serve as the search backend.
+Configure it on the tool entry:
 
 ```yaml
 agents:
@@ -83,14 +90,19 @@ agents:
           search_function: search     # function used for every query kind
 ```
 
-- `search_tool` — name of the registered tool to resolve for searches. If the calling agent's config also carries an entry for that tool (e.g. with project or API settings), those settings are reused when the search tool is built.
-- `search_function` — a single function on that tool, called as `fn(query)` (a `num_results` keyword is passed only when the function accepts one). All query kinds (web/news/scholar) route to it. Leave unset for Serper's `search_web`/`search_news`/`search_scholar` routing.
+- `search_tool` — name of the registered tool to resolve for searches.
+  If the calling agent's config also carries an entry for that tool (e.g. with project or API settings), those settings are reused when the search tool is built.
+- `search_function` — a single function on that tool, called as `fn(query)` (a `num_results` keyword is passed only when the function accepts one).
+  All query kinds (web/news/scholar) route to it.
+  Leave unset for Serper's `search_web`/`search_news`/`search_scholar` routing.
 
-The search function must return JSON. Both Serper-style payloads (`organic`/`news`/`scholar` rows with `link`/`title`/`snippet`) and generic shapes (top-level lists, or `results`/`sources`/`items`/`documents` rows with `url`/`uri`/`permalink`, `title`, and `snippet`/`description`/`context`/`text`/`domain`) are understood; payloads with `error` or `status: "error"` are surfaced as search failures.
+The search function must return JSON.
+Both Serper-style payloads (`organic`/`news`/`scholar` rows with `link`/`title`/`snippet`) and generic shapes (top-level lists, or `results`/`sources`/`items`/`documents` rows with `url`/`uri`/`permalink`, `title`, and `snippet`/`description`/`context`/`text`/`domain`) are understood; payloads with `error` or `status: "error"` are surfaced as search failures.
 
 ### Extra search channels
 
-Beyond the default web backend, the reasoner can be given additional evidence backends — an internal wiki, an enterprise document index, a chat-history search — as named channels. Each channel maps a name (which the reasoner uses as a query `kind`) to a registered MindRoom tool and function:
+Beyond the default web backend, the reasoner can be given additional evidence backends — an internal wiki, an enterprise document index, a chat-history search — as named channels.
+Each channel maps a name (which the reasoner uses as a query `kind`) to a registered MindRoom tool and function:
 
 ```yaml
 agents:
@@ -112,9 +124,11 @@ agents:
 
 - The reasoner sees each channel's name and description in its planning prompt and picks the fitting channel per query; unknown kinds fall back to the web channel.
 - Channel functions are called like the main search function (`fn(query)`, with `num_results` only when accepted) and must return JSON in one of the shapes above — rows need a URL (or permalink) to enter the source registry.
-- Channel tools are resolved with the calling agent's authored overrides for that tool, like the main search backend. An unavailable channel is dropped for the run and reported in the result's `warnings` instead of failing the research.
+- Channel tools are resolved with the calling agent's authored overrides for that tool, like the main search backend.
+  An unavailable channel is dropped for the run and reported in the result's `warnings` instead of failing the research.
 - Channel names `web`, `news`, and `scholar` are reserved for the main backend.
-- Functions that take structured keyword arguments instead of a single query string — MCP tools in particular, including the `<prefix>_call_tool` bridge of OAuth-backed MCP servers — can be called through an `arguments` template with `{query}` and `{num_results}` placeholders. A string that is exactly one placeholder keeps the substituted value's type (so `"{num_results}"` becomes an integer):
+- Functions that take structured keyword arguments instead of a single query string — MCP tools in particular, including the `<prefix>_call_tool` bridge of OAuth-backed MCP servers — can be called through an `arguments` template with `{query}` and `{num_results}` placeholders.
+  A string that is exactly one placeholder keeps the substituted value's type (so `"{num_results}"` becomes an integer):
 
   ```yaml
   - name: wiki
