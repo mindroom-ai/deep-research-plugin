@@ -73,14 +73,16 @@ def _coerce_channel_entries(raw: object) -> list[object]:
         text = raw.strip()
         if not text:
             return []
-        try:
-            # A successful parse of "[...]" is always a list.
-            return json.loads(f"[{text}]")
-        except json.JSONDecodeError:
-            # Comma-joined compact entries: split only where the next segment
-            # looks like a compact channel ("name="), so commas inside
-            # descriptions do not split.
-            return re.split(r", (?=[A-Za-z0-9_-]+=)", text)
+        if text.startswith("{"):
+            try:
+                # A successful parse of "[...]" is always a list.
+                return json.loads(f"[{text}]")
+            except json.JSONDecodeError:
+                pass
+        # Comma-joined compact entries: split only where the next segment
+        # looks like a compact channel ("name="), so commas inside
+        # descriptions do not split.
+        return re.split(r", (?=[A-Za-z0-9_-]+=)", text)
     if not isinstance(raw, list):
         return []
     entries: list[object] = []
