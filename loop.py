@@ -23,6 +23,7 @@ RESULTS_PER_QUERY = 10
 RESULTS_PER_QUERY_CAP = 30
 MAX_READS_PER_ROUND = 10
 MAX_READS_PER_ROUND_CAP = 20
+SNIPPET_SOURCES_PER_ROUND_CAP = 5
 REPORT_TOKEN_CAP = 16_000
 REPORT_CHAR_CAP = REPORT_TOKEN_CAP * 4
 NO_PROGRESS_LIMIT = 3
@@ -66,6 +67,7 @@ class ResearchStep(BaseModel):
     next_action: Literal["search", "read", "finish"]
     search_queries: list[SearchQuery] = []
     read_urls: list[str] = []
+    cite_snippet_urls: list[str] = []
 
 
 class Extraction(BaseModel):
@@ -331,6 +333,42 @@ def _register_source(
     )
     sources_by_url[normalized_url] = record
     return record, True
+
+
+def _canonical_candidate_key(url: str) -> str:
+    return url.strip().split("#", 1)[0].rstrip("/")
+
+
+def _match_candidate(
+    candidate_meta: dict[str, tuple[str, str]],
+    raw_url: str,
+) -> tuple[str, tuple[str, str]] | None:
+    """Match a nominated URL to a stored candidate, tolerating fragment and trailing-slash variants.
+
+    Both sides are compared in canonical form (fragment and trailing slash
+    stripped), so a variant on either the nominated or the stored URL still
+    matches. Among canonical-equivalent stored candidates, one with a
+    non-empty snippet wins, so an empty variant cannot shadow a useful one.
+    Returns the stored candidate URL (not the nominated variant) so
+    downstream registration keys stay consistent with reads of the same page.
+    """
+    url = raw_url.strip()
+    if not url:
+        return None
+    exact = candidate_meta.get(url)
+    if exact is not None and exact[1]:
+        return url, exact
+    fallback = (url, exact) if exact is not None else None
+    canonical = _canonical_candidate_key(url)
+    if canonical:
+        for stored_url, stored_meta in candidate_meta.items():
+            if _canonical_candidate_key(stored_url) != canonical:
+                continue
+            if stored_meta[1]:
+                return stored_url, stored_meta
+            if fallback is None:
+                fallback = (stored_url, stored_meta)
+    return fallback
 
 
 def _coerce_hits(raw_hits: Sequence[SearchHit | dict[str, object]]) -> list[SearchHit]:
@@ -618,6 +656,7 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
         "duplicate_queries_skipped": 0,
         "duplicate_reads_skipped": 0,
         "read_snippet_fallbacks": 0,
+        "snippet_sources_registered": 0,
     }
     start = clock() if budget_start is None else budget_start
     total_budget = _WallClockBudget(start=start, seconds=wall_clock_seconds, clock=clock)
@@ -662,7 +701,17 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     def _note_candidate(hit: SearchHit) -> str:
         url = hit.url.strip()
         considered_urls.add(url)
-        candidate_meta.setdefault(url, (hit.title, hit.snippet))
+        title = hit.title.strip()
+        snippet = hit.snippet.strip()
+        existing = candidate_meta.get(url)
+        if existing is None:
+            candidate_meta[url] = (title, snippet)
+        else:
+            # A later hit for the same URL may carry the title or snippet the
+            # first one lacked; fill gaps so snippet citation stays possible.
+            stored_title, stored_snippet = existing
+            if (not stored_title and title) or (not stored_snippet and snippet):
+                candidate_meta[url] = (stored_title or title, stored_snippet or snippet)
         return _candidate_line(hit)
 
     seed_query = SearchQuery(query=question)
@@ -763,6 +812,34 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
                 warnings.append(_wall_clock_warning(exc.label))
                 break
 
+        # Reasoner-nominated candidates become citable unvetted sources from
+        # their search snippet alone, without spending a page read. Only URLs
+        # that actually appeared as search hits (candidate_meta) qualify, so
+        # a hallucinated URL cannot enter the registry; registration keys on
+        # the stored candidate URL, so a later full read of the same page
+        # upgrades the same source id with vetted facts. Runs before the stop
+        # checks so a final "cite these and finish" step still lands.
+        snippet_evidence: list[str] = []
+        registered_snippet_sources = 0
+        for raw_url in step.cite_snippet_urls:
+            if registered_snippet_sources >= SNIPPET_SOURCES_PER_ROUND_CAP:
+                break
+            match = _match_candidate(candidate_meta, raw_url)
+            if match is None:
+                continue
+            url, (title, snippet) = match
+            snippet = snippet.strip()
+            if not snippet or url in sources_by_url:
+                continue
+            registered_snippet_sources += 1
+            stats["snippet_sources_registered"] += 1
+            source, _ = _register_source(sources_by_url, url=url, title=title, snippet=snippet)
+            fact = f"Unvetted search snippet: {snippet}"
+            source_facts = facts_by_source.setdefault(source.id, [])
+            if fact not in source_facts and len(source_facts) < FACTS_PER_SOURCE_CAP:
+                source_facts.append(fact)
+            snippet_evidence.append(f"[{source.id}] {fact}")
+
         if confidence >= CONFIDENCE_STOP and sources_by_url:
             stopped_reason = "confident"
             break
@@ -830,14 +907,20 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
                 # into this worker's own read_results slot keeps the fallback
                 # on the same merge path as a successful read — if the batch
                 # structure ever changes, this write must move with it.
-                _, snippet = candidate_meta.get(url, ("", ""))
-                snippet = snippet.strip()
+                # Variant-tolerant matching so a read of e.g. the
+                # trailing-slash form still finds the stored candidate; the
+                # page keeps the matched URL so registration lands on the
+                # same key as snippet citations of that candidate.
+                match = _match_candidate(candidate_meta, url)
+                if match is None:
+                    return
+                matched_url, (matched_title, snippet) = match
                 if not snippet:
                     return
                 stats["read_snippet_fallbacks"] += 1
                 read_results[index] = (
                     url,
-                    Page(url=url, title="", text=""),
+                    Page(url=matched_url, title=matched_title, text=""),
                     Extraction(facts=[f"Unvetted search snippet: {snippet}"], relevant=True),
                 )
 
@@ -900,6 +983,11 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
 
         evidence: list[str] = []
         made_progress = False
+        for evidence_line in snippet_evidence:
+            if evidence_line not in seen_evidence:
+                made_progress = True
+                evidence.append(evidence_line)
+            seen_evidence.add(evidence_line)
         for index in sorted(search_results):
             for hit in search_results[index][:results_per_query]:
                 evidence_line = _note_candidate(hit)
@@ -913,7 +1001,8 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
             considered_urls.add(url)
             if not extraction.relevant:
                 continue
-            candidate_title, candidate_snippet = candidate_meta.get(url, ("", ""))
+            candidate_match = _match_candidate(candidate_meta, url)
+            candidate_title, candidate_snippet = candidate_match[1] if candidate_match else ("", "")
             title = page.title.strip()
             if not title or title == page.url:
                 title = candidate_title
