@@ -16,6 +16,7 @@ Ask one hard question and get back a cited report. `deep_research` runs a bounde
 - Heavy mode (`parallel_researchers`): up to 4 independent research loops explore the question from different angles concurrently, then one synthesis pass integrates their cited reports over a merged source registry (Tongyi DeepResearch's Research-Synthesis pattern)
 - Role-based model routing: `extract_model` sends the high-volume page-extraction role to a cheaper model while reasoning and synthesis stay on the strong one
 - Reuses MindRoom's existing tools: a configurable search tool (Serper by default) and the native website reader
+- Optional extra search channels (`search_channels`): named evidence backends — an internal wiki, enterprise document index, chat-history search — that the reasoner queries by setting a query's `kind`, with graceful degradation when a channel is unavailable
 - Rolling summarize-and-replace report keeps long runs inside the context budget
 - Append-only per-source fact bank, so extracted facts survive compression and feed final synthesis
 - Stable `[n]` citations backed by a verified source registry that is the single source of truth
@@ -83,7 +84,36 @@ agents:
 - `search_tool` — name of the registered tool to resolve for searches. If the calling agent's config also carries an entry for that tool (e.g. with project or API settings), those settings are reused when the search tool is built.
 - `search_function` — a single function on that tool, called as `fn(query)` (a `num_results` keyword is passed only when the function accepts one). All query kinds (web/news/scholar) route to it. Leave unset for Serper's `search_web`/`search_news`/`search_scholar` routing.
 
-The search function must return JSON. Both Serper-style payloads (`organic`/`news`/`scholar` rows with `link`/`title`/`snippet`) and generic shapes (`results`/`sources`/`items` rows with `url` or `uri`, `title`, and `snippet`/`description`/`domain`) are understood; payloads with `error` or `status: "error"` are surfaced as search failures.
+The search function must return JSON. Both Serper-style payloads (`organic`/`news`/`scholar` rows with `link`/`title`/`snippet`) and generic shapes (top-level lists, or `results`/`sources`/`items`/`documents` rows with `url`/`uri`/`permalink`, `title`, and `snippet`/`description`/`context`/`text`/`domain`) are understood; payloads with `error` or `status: "error"` are surfaced as search failures.
+
+### Extra search channels
+
+Beyond the default web backend, the reasoner can be given additional evidence backends — an internal wiki, an enterprise document index, a chat-history search — as named channels. Each channel maps a name (which the reasoner uses as a query `kind`) to a registered MindRoom tool and function:
+
+```yaml
+agents:
+  researcher:
+    tools:
+      - deep_research:
+          search_tool: my_search
+          search_function: search
+          search_channels:
+            - name: wiki
+              description: Internal documentation and runbooks
+              tool: my_wiki_tool
+              function: search_documents
+            - name: chat
+              description: Team chat history
+              tool: my_chat_search
+              function: search_messages
+```
+
+- The reasoner sees each channel's name and description in its planning prompt and picks the fitting channel per query; unknown kinds fall back to the web channel.
+- Channel functions are called like the main search function (`fn(query)`, with `num_results` only when accepted) and must return JSON in one of the shapes above — rows need a URL (or permalink) to enter the source registry.
+- Channel tools are resolved with the calling agent's authored overrides for that tool, like the main search backend. An unavailable channel is dropped for the run and reported in the result's `warnings` instead of failing the research.
+- Channel names `web`, `news`, and `scholar` are reserved for the main backend.
+- Internal URLs that the native website reader cannot fetch degrade to their search snippet as unvetted sources, and the reasoner can cite snippet-backed channel hits directly via `cite_snippet_urls` — so channels remain useful even when their pages are not readable.
+- UIs that only accept strings can use the compact form `"wiki=my_wiki_tool.search_documents|Internal documentation"`.
 
 ## Setup
 
