@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 import time
 from collections.abc import Callable
 
@@ -55,6 +56,7 @@ TOOL_NAME = "deep_research"
 DEFAULT_SEARCH_TOOL = "serper"
 SERPER_SEARCH_FUNCTIONS = {"web": "search_web", "news": "search_news", "scholar": "search_scholar"}
 HIT_SNIPPET_CHAR_LIMIT = 500
+_PLACEHOLDER_RE = re.compile(r"\{query\}|\{num_results\}")
 
 
 def _parse_search_channels(raw: object) -> list[dict[str, object]]:
@@ -279,7 +281,12 @@ def _substitute_placeholders(value: object, *, query: str, num_results: int) -> 
             return query
         if value == "{num_results}":
             return num_results
-        return value.replace("{query}", query).replace("{num_results}", str(num_results))
+        # Single-pass substitution: placeholder-like text inside the query
+        # itself must not be expanded again.
+        return _PLACEHOLDER_RE.sub(
+            lambda match: query if match.group() == "{query}" else str(num_results),
+            value,
+        )
     if isinstance(value, dict):
         return {key: _substitute_placeholders(item, query=query, num_results=num_results) for key, item in value.items()}
     if isinstance(value, list):
@@ -311,9 +318,32 @@ async def _call_search_function(
         raw = await asyncio.to_thread(entrypoint, *args, **kwargs)
         if inspect.isawaitable(raw):
             raw = await raw
-    # MCP tool calls return result objects whose text lives in .content.
-    raw = getattr(raw, "content", raw)
-    return raw if isinstance(raw, str) else str(raw)
+    return _result_text(raw)
+
+
+def _result_text(raw: object) -> str:
+    """Normalize a search call's return value to text.
+
+    MCP-style result objects carry their text in .content — either a string
+    or a list of content blocks. The unwrap is deliberately conservative:
+    anything that does not yield usable text falls back to the previous
+    stringification, so plain results and unrelated .content attributes
+    keep their old behavior.
+    """
+    if isinstance(raw, str):
+        return raw
+    content = getattr(raw, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts: list[str] = []
+        for block in content:
+            text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+            if isinstance(text, str) and text.strip():
+                texts.append(text)
+        if texts:
+            return "\n".join(texts)
+    return str(raw)
 
 
 def _tool_entry_field(entry: object, field: str) -> object:

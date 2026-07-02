@@ -1358,3 +1358,36 @@ async def test_mcp_bridge_channel_uses_arguments_template_async_functions_and_co
     assert bridge_calls == [
         {"tool_name": "search_documents", "arguments": {"query": "frobnicator runbook", "limit": 5}},
     ]
+
+
+def test_substitute_placeholders_does_not_reexpand_placeholder_text_in_query() -> None:
+    module = _load_tools_module()
+
+    substituted = module._substitute_placeholders(
+        {"note": "q={query} limit={num_results}"},
+        query="find {num_results} docs",
+        num_results=5,
+    )
+
+    assert substituted == {"note": "q=find {num_results} docs limit=5"}
+
+
+def test_result_text_unwraps_string_and_block_list_content_conservatively() -> None:
+    module = _load_tools_module()
+
+    class StrContent:
+        content = '{"results": []}'
+
+    class BlockContent:
+        content = [SimpleNamespace(text='{"documents": []}'), {"text": "second block"}, {"no_text": True}]
+
+    class UnrelatedContent:
+        content = 42
+
+        def __str__(self) -> str:
+            return "plain repr"
+
+    assert module._result_text("already text") == "already text"
+    assert module._result_text(StrContent()) == '{"results": []}'
+    assert module._result_text(BlockContent()) == '{"documents": []}\nsecond block'
+    assert module._result_text(UnrelatedContent()) == "plain repr"
