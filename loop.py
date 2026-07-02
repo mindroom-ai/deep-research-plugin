@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Generic, Literal, TypeVar
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from .prompts import extractor_prompt, heavy_synthesize_prompt, reasoner_prompt, synthesize_prompt
 
@@ -54,7 +54,14 @@ class SearchQuery(BaseModel):
     """One search request planned by the reasoner."""
 
     query: str
-    kind: Literal["web", "scholar", "news"] = "web"
+    kind: str = "web"
+
+    @field_validator("kind")
+    @classmethod
+    def normalize_kind(cls, value: str) -> str:
+        """Lowercase the channel name; unknown kinds fall back to web at search time."""
+        normalized = value.strip().lower()
+        return normalized or "web"
 
 
 class ResearchStep(BaseModel):
@@ -632,6 +639,7 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     retry_backoff_seconds: float = RETRY_BACKOFF_SECONDS,
     max_concurrency: int = MAX_CONCURRENCY,
     angle: str = "",
+    search_channels: Sequence[tuple[str, str]] = (),
 ) -> LoopResult:
     """Run the bounded research loop using injected LLM and network callables."""
     max_rounds = clamp_int(max_rounds, minimum=1, maximum=MAX_ROUNDS_CAP)
@@ -758,6 +766,7 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
             recent_queries=executed_queries[-RECENT_QUERIES_PROMPT_CAP:],
             fetched_urls=attempted_read_order[-FETCHED_URLS_PROMPT_CAP:],
             angle=angle,
+            search_channels=search_channels,
         )
         fallback_step = ResearchStep(
             thought="Structured reasoner output failed; skipping this round.",
@@ -1218,6 +1227,7 @@ async def run_heavy_research_loop(
     op_timeout_seconds: float = OP_TIMEOUT_SECONDS,
     retry_backoff_seconds: float = RETRY_BACKOFF_SECONDS,
     max_concurrency: int = MAX_CONCURRENCY,
+    search_channels: Sequence[tuple[str, str]] = (),
 ) -> LoopResult:
     """Run N research loops on different angles concurrently and synthesize one report.
 
@@ -1251,6 +1261,7 @@ async def run_heavy_research_loop(
             "op_timeout_seconds": op_timeout_seconds,
             "retry_backoff_seconds": retry_backoff_seconds,
             "max_concurrency": max_concurrency,
+            "search_channels": search_channels,
         }
 
     if researchers == 1:

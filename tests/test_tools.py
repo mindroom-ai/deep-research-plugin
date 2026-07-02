@@ -1023,3 +1023,213 @@ async def test_integration_smoke_live_research() -> None:
     assert result["tool"] == "deep_research"
     assert result["sources"]
     assert "[" in result["report"]
+
+
+def test_parse_search_channels_accepts_dicts_and_compact_strings() -> None:
+    module = _load_tools_module()
+
+    channels = module._parse_search_channels(
+        [
+            {"name": " Wiki ", "tool": "wiki_tool", "function": "search_documents", "description": "Internal wiki"},
+            "chat=chat_tool.search_messages|Team chat history",
+            "web=shadow_tool.search",
+            {"name": "wiki", "tool": "duplicate", "function": "search"},
+            {"name": "broken", "tool": "", "function": "search"},
+            42,
+        ],
+    )
+
+    assert channels == [
+        {"name": "wiki", "tool": "wiki_tool", "function": "search_documents", "description": "Internal wiki"},
+        {"name": "chat", "tool": "chat_tool", "function": "search_messages", "description": "Team chat history"},
+    ]
+
+
+def test_parse_search_results_accepts_top_level_lists_and_context_snippets() -> None:
+    module = _load_tools_module()
+
+    hits = module._parse_search_results(
+        json.dumps(
+            [
+                {"url": "https://wiki.example/doc/runbook", "title": "Runbook", "context": "restart the frobnicator"},
+                {"permalink": "https://chat.example/msg/1", "text": "x" * 1000},
+                {"title": "no url row"},
+            ],
+        ),
+    )
+
+    assert [hit.url for hit in hits] == ["https://wiki.example/doc/runbook", "https://chat.example/msg/1"]
+    assert hits[0].snippet == "restart the frobnicator"
+    assert len(hits[1].snippet) == module.HIT_SNIPPET_CHAR_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_search_channels_route_by_kind_and_advertise_to_reasoner() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools(
+        search_tool="grounded_search",
+        search_function="search_public_web",
+        search_channels=[
+            {"name": "wiki", "tool": "wiki_tool", "function": "search_documents", "description": "Internal wiki"},
+        ],
+    )
+    channel_queries: list[str] = []
+    web_queries: list[str] = []
+
+    class GroundedSearch:
+        def search_public_web(self, query: str) -> str:
+            web_queries.append(query)
+            return json.dumps({"sources": [{"uri": "https://web.example/a", "title": "W"}]})
+
+    class WikiTool:
+        def search_documents(self, query: str) -> str:
+            channel_queries.append(query)
+            return json.dumps([{"url": "https://wiki.example/doc/1", "title": "Doc", "context": "wiki fact"}])
+
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
+        if name == "grounded_search":
+            return GroundedSearch()
+        if name == "wiki_tool":
+            return WikiTool()
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    async def fake_loop(**kwargs: Any) -> Any:
+        loop = _load_loop_module()
+        assert ("wiki", "Internal wiki") in kwargs["search_channels"]
+        assert kwargs["search_channels"][0][0] == "web"
+        wiki_hits = await kwargs["search_fn"](loop.SearchQuery(query="wiki q", kind="wiki"), 5)
+        assert wiki_hits[0].url == "https://wiki.example/doc/1"
+        assert wiki_hits[0].snippet == "wiki fact"
+        web_hits = await kwargs["search_fn"](loop.SearchQuery(query="web q", kind="web"), 5)
+        assert web_hits[0].url == "https://web.example/a"
+        unknown_hits = await kwargs["search_fn"](loop.SearchQuery(query="fallback q", kind="mystery"), 5)
+        assert unknown_hits[0].url == "https://web.example/a"
+        return _result(module)
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", side_effect=fake_loop),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+    assert channel_queries == ["wiki q"]
+    assert web_queries == ["web q", "fallback q"]
+
+
+@pytest.mark.asyncio
+async def test_unavailable_search_channel_degrades_with_warning() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools(
+        search_tool="grounded_search",
+        search_function="search_public_web",
+        search_channels=["wiki=missing_tool.search|Internal wiki"],
+    )
+
+    class GroundedSearch:
+        def search_public_web(self, _query: str) -> str:
+            return json.dumps({"sources": []})
+
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
+        if name == "grounded_search":
+            return GroundedSearch()
+        if name == "missing_tool":
+            raise RuntimeError("not registered")
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    async def fake_loop(**kwargs: Any) -> Any:
+        assert all(name != "wiki" for name, _description in kwargs["search_channels"])
+        return _result(module)
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", side_effect=fake_loop),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+    assert any("search channel 'wiki' unavailable" in warning for warning in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_search_channel_tools_resolve_with_agent_authored_overrides() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools(
+        search_tool="grounded_search",
+        search_function="search_public_web",
+        search_channels=[{"name": "wiki", "tool": "wiki_tool", "function": "search_documents"}],
+    )
+    context = _tool_context(sender=AsyncMock())
+    context.config.agents = {
+        "code": SimpleNamespace(
+            tools=[SimpleNamespace(name="wiki_tool", overrides={"collection": "engineering"})],
+        ),
+    }
+    calls: list[tuple[str, Any]] = []
+
+    class GroundedSearch:
+        def search_public_web(self, _query: str) -> str:
+            return json.dumps({"sources": []})
+
+    class WikiTool:
+        def search_documents(self, _query: str) -> str:
+            return json.dumps([])
+
+    def tool_by_name(name: str, *_args: Any, **kwargs: Any) -> Any:
+        calls.append((name, kwargs.get("tool_config_overrides")))
+        if name == "grounded_search":
+            return GroundedSearch()
+        if name == "wiki_tool":
+            return WikiTool()
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    with (
+        tool_runtime_context(context),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+    assert ("wiki_tool", {"collection": "engineering"}) in calls
+
+
+def test_parse_search_results_skips_non_string_values_in_key_chains() -> None:
+    module = _load_tools_module()
+
+    hits = module._parse_search_results(
+        json.dumps(
+            {
+                "results": [
+                    {
+                        "link": {"metadata": "not a url"},
+                        "url": "https://real.example/a",
+                        "title": ["not", "a", "title"],
+                        "name": "Real Title",
+                        "snippet": 42,
+                        "description": "real snippet",
+                    },
+                    {"link": {"only": "junk"}},
+                ],
+            },
+        ),
+    )
+
+    assert len(hits) == 1
+    assert hits[0].url == "https://real.example/a"
+    assert hits[0].title == "Real Title"
+    assert hits[0].snippet == "real snippet"

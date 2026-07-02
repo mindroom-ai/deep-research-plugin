@@ -11,6 +11,14 @@ if TYPE_CHECKING:
 
 _PAGE_TEXT_TAG_RE = re.compile(r"<(?=/?\s*page_text)", re.IGNORECASE)
 
+# Single source of truth for the built-in channel names and the descriptions
+# the reasoner sees; tools.py reserves these names and advertises them.
+BASE_CHANNEL_DESCRIPTIONS = {
+    "web": "general public web search",
+    "news": "recent news coverage",
+    "scholar": "academic and scholarly sources",
+}
+
 
 def _neutralize_page_text_tags(page_text: str) -> str:
     """Escape page_text delimiter tags so untrusted content cannot close the data block."""
@@ -29,12 +37,16 @@ def reasoner_prompt(
     recent_queries: Sequence[str] = (),
     fetched_urls: Sequence[str] = (),
     angle: str = "",
+    search_channels: Sequence[tuple[str, str]] = (),
 ) -> str:
     """Build the structured reasoner prompt."""
     evidence_text = "\n".join(f"- {item}" for item in pending_evidence) or "- (no new evidence)"
     sources_text = "\n".join(f"- {item}" for item in sources) or "- (no sources yet)"
     queries_text = "\n".join(f"- {item}" for item in recent_queries) or "- (none yet)"
     fetched_text = "\n".join(f"- {item}" for item in fetched_urls) or "- (none yet)"
+    channels_text = "\n".join(f"- {name}: {description}" for name, description in search_channels) or "\n".join(
+        f"- {name}: {description}" for name, description in BASE_CHANNEL_DESCRIPTIONS.items()
+    )
     angle_text = f"\nYour assigned research angle (let it guide your queries and reads):\n{angle}\n" if angle else ""
     return f"""You are the planning and compression step in an iterative research loop.
 
@@ -66,8 +78,12 @@ workspace. Keep it concise and cite claims with existing [n] source IDs when
 available. Lines beginning "Candidate URL:" are discovery leads only; do not
 cite them unless they later appear in the source registry with a [n] ID.
 
+Search channels (set each query's kind to one of these; unknown kinds fall
+back to the default web channel):
+{channels_text}
+
 Decide next_action:
-- search: when more search results are needed; provide up to {max_queries} focused queries.
+- search: when more search results are needed; provide up to {max_queries} focused queries, each with the most fitting channel as its kind.
 - read: when specific URLs should be fetched; provide up to {max_reads} URLs.
 - finish: when the report can answer the question.
 You may provide both search_queries and read_urls in the same round; both run

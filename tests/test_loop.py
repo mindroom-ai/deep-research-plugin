@@ -2340,3 +2340,31 @@ async def test_failed_read_of_url_variant_falls_back_to_stored_candidate_snippet
     assert [source["url"] for source in result.sources] == ["https://primary.example/press"]
     assert result.sources[0]["title"] == "Primary PR"
     assert result.sources[0]["snippet"] == "The launch happened."
+
+
+def test_search_query_kind_is_normalized_free_text() -> None:
+    assert loop.SearchQuery(query="q", kind="  Wiki ").kind == "wiki"
+    assert loop.SearchQuery(query="q", kind="   ").kind == "web"
+    assert loop.SearchQuery(query="q").kind == "web"
+
+
+def test_reasoner_prompt_lists_search_channels() -> None:
+    prompt = prompts.reasoner_prompt(
+        question="q",
+        report="",
+        pending_evidence=[],
+        sources=[],
+        budget_left="1 round",
+        search_channels=[("web", "general public web search"), ("wiki", "Internal wiki")],
+    )
+    assert "- wiki: Internal wiki" in prompt
+    assert "- web: general public web search" in prompt
+
+    default_prompt = prompts.reasoner_prompt(
+        question="q",
+        report="",
+        pending_evidence=[],
+        sources=[],
+        budget_left="1 round",
+    )
+    assert "- scholar: academic and scholarly sources" in default_prompt

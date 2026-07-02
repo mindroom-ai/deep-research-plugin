@@ -28,6 +28,7 @@ from mindroom.tool_system.runtime_context import (
     resolve_tool_runtime_hook_bindings,
 )
 
+from .prompts import BASE_CHANNEL_DESCRIPTIONS
 from .loop import (
     MAX_ROUNDS_CAP,
     MAX_QUERIES_PER_ROUND,
@@ -53,6 +54,54 @@ LOGGER = get_logger(__name__)
 TOOL_NAME = "deep_research"
 DEFAULT_SEARCH_TOOL = "serper"
 SERPER_SEARCH_FUNCTIONS = {"web": "search_web", "news": "search_news", "scholar": "search_scholar"}
+HIT_SNIPPET_CHAR_LIMIT = 500
+
+
+def _parse_search_channels(raw: object) -> list[dict[str, str]]:
+    """Normalize authored search_channels config into channel dicts.
+
+    Accepts structured entries ({name, tool, function, description}) and the
+    compact string form "name=tool.function|description" (for UIs that only
+    take strings). Invalid entries and names that shadow the built-in
+    web/news/scholar channels are dropped with a warning.
+    """
+    channels: list[dict[str, str]] = []
+    seen_names: set[str] = set()
+    for entry in raw if isinstance(raw, list) else []:
+        if isinstance(entry, dict):
+            name = str(entry.get("name") or "").strip().lower()
+            tool = str(entry.get("tool") or "").strip()
+            function = str(entry.get("function") or "").strip()
+            description = str(entry.get("description") or "").strip()
+        elif isinstance(entry, str):
+            head, _, description = entry.partition("|")
+            name, _, target = head.partition("=")
+            tool, _, function = target.strip().partition(".")
+            name = name.strip().lower()
+            tool = tool.strip()
+            function = function.strip()
+            description = description.strip()
+        else:
+            LOGGER.warning("deep_research_search_channel_invalid", entry=repr(entry))
+            continue
+        if not name or not tool or not function:
+            LOGGER.warning("deep_research_search_channel_incomplete", entry=repr(entry))
+            continue
+        if name in BASE_CHANNEL_DESCRIPTIONS or name in seen_names:
+            LOGGER.warning("deep_research_search_channel_name_conflict", channel=name)
+            continue
+        seen_names.add(name)
+        channels.append(
+            {
+                "name": name,
+                "tool": tool,
+                "function": function,
+                "description": description or f"search via the {tool} tool",
+            },
+        )
+    return channels
+
+
 DEFAULT_MAX_ROUNDS = MAX_ROUNDS_CAP
 DEFAULT_WALL_CLOCK_SECONDS = WALL_CLOCK_SECONDS_CAP
 DEFAULT_MAX_QUERIES_PER_ROUND = MAX_QUERIES_PER_ROUND
@@ -140,34 +189,44 @@ def _extract_text_from_website_payload(payload: str) -> tuple[str, str]:
     return title, "\n\n".join(chunks)
 
 
+def _first_string(row: dict[str, object], keys: tuple[str, ...]) -> str:
+    """Return the first non-empty string value among keys, skipping non-string values."""
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
 def _parse_search_results(raw: str) -> list[SearchHit]:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
         return []
-    if not isinstance(parsed, dict):
-        return []
-    error = parsed.get("error")
-    if error or str(parsed.get("status") or "").lower() == "error":
-        detail = error or parsed.get("message") or parsed.get("description") or parsed.get("code")
-        raise RuntimeError(str(detail or "search failed"))
     rows: list[object] = []
-    for key in ("organic", "news", "articles", "scholar", "results", "sources", "items"):
-        value = parsed.get(key)
-        if isinstance(value, list):
-            rows.extend(value)
+    if isinstance(parsed, list):
+        rows = list(parsed)
+    elif isinstance(parsed, dict):
+        error = parsed.get("error")
+        if error or str(parsed.get("status") or "").lower() == "error":
+            detail = error or parsed.get("message") or parsed.get("description") or parsed.get("code")
+            raise RuntimeError(str(detail or "search failed"))
+        for key in ("organic", "news", "articles", "scholar", "results", "sources", "items", "documents"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                rows.extend(value)
+    else:
+        return []
     hits: list[SearchHit] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
-        url = row.get("link") or row.get("url") or row.get("uri")
-        if not isinstance(url, str) or not url:
+        url = _first_string(row, ("link", "url", "uri", "permalink"))
+        if not url:
             continue
-        title = str(row.get("title") or row.get("name") or url)
-        snippet = str(
-            row.get("snippet") or row.get("description") or row.get("summary") or row.get("domain") or "",
-        )
-        hits.append(SearchHit(url=url, title=title, snippet=snippet))
+        title = _first_string(row, ("title", "name")) or url
+        snippet = _first_string(row, ("snippet", "description", "summary", "context", "text", "domain"))
+        hits.append(SearchHit(url=url, title=title, snippet=snippet[:HIT_SNIPPET_CHAR_LIMIT]))
     return hits
 
 
@@ -275,10 +334,17 @@ def _format_round_progress(event: dict[str, object], *, verbose: bool) -> str:
 class DeepResearchTools(Toolkit):
     """Toolkit exposing bounded web research as one MindRoom tool."""
 
-    def __init__(self, *, search_tool: str | None = None, search_function: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        search_tool: str | None = None,
+        search_function: str | None = None,
+        search_channels: object = None,
+    ) -> None:
         self.search_tool = (search_tool or "").strip() if isinstance(search_tool, str) else ""
         self.search_tool = self.search_tool or DEFAULT_SEARCH_TOOL
         self.search_function = (search_function or "").strip() if isinstance(search_function, str) else ""
+        self.search_channels = _parse_search_channels(search_channels)
         super().__init__(
             name=TOOL_NAME,
             instructions=(
@@ -393,6 +459,44 @@ class DeepResearchTools(Toolkit):
                 "Configure its API key to use deep_research.",
             )
 
+        # Extra search channels degrade gracefully: an unavailable channel is
+        # dropped (and reported in warnings) instead of failing the run, and
+        # the reasoner is only told about channels that actually resolved.
+        channels: dict[str, dict[str, object]] = {}
+        channel_warnings: list[str] = []
+        for channel_config in self.search_channels:
+            channel_name = str(channel_config["name"])
+            channel_tool = str(channel_config["tool"])
+            channel_function = str(channel_config["function"])
+            try:
+                channel_toolkit = get_tool_by_name(
+                    channel_tool,
+                    context.runtime_paths,
+                    tool_config_overrides=_authored_tool_overrides(context, channel_tool) or None,
+                    worker_target=None,
+                )
+                _tool_function_entrypoint(channel_toolkit, channel_function)
+            except Exception as exc:
+                LOGGER.warning(
+                    "deep_research_search_channel_unavailable",
+                    channel=channel_name,
+                    tool=channel_tool,
+                    error=str(exc),
+                )
+                channel_warnings.append(f"search channel '{channel_name}' unavailable: {exc}")
+                continue
+            channels[channel_name] = {
+                "toolkit": channel_toolkit,
+                "function": channel_function,
+                "description": str(channel_config["description"]),
+            }
+
+        if self.search_function:
+            prompt_channels = [("web", BASE_CHANNEL_DESCRIPTIONS["web"])]
+        else:
+            prompt_channels = [(name, BASE_CHANNEL_DESCRIPTIONS[name]) for name in ("web", "news", "scholar")]
+        prompt_channels.extend((name, str(channel["description"])) for name, channel in channels.items())
+
         try:
             website = get_tool_by_name(
                 "website",
@@ -439,8 +543,21 @@ class DeepResearchTools(Toolkit):
             return content if isinstance(content, str) else str(content)
 
         async def search_fn(query: SearchQuery, limit: int) -> list[SearchHit]:
-            search_method = self.search_function or SERPER_SEARCH_FUNCTIONS[query.kind]
-            raw = await _call_search_function(search_toolkit, search_method, query.query, num_results=limit)
+            channel = channels.get(query.kind)
+            if channel is not None:
+                raw = await _call_search_function(
+                    channel["toolkit"],
+                    str(channel["function"]),
+                    query.query,
+                    num_results=limit,
+                )
+            else:
+                search_method = (
+                    self.search_function
+                    or SERPER_SEARCH_FUNCTIONS.get(query.kind)
+                    or SERPER_SEARCH_FUNCTIONS["web"]
+                )
+                raw = await _call_search_function(search_toolkit, search_method, query.query, num_results=limit)
             return _parse_search_results(raw)
 
         async def read_fn(url: str) -> Page:
@@ -479,6 +596,7 @@ class DeepResearchTools(Toolkit):
                 "results_per_query": results_per_query,
                 "max_reads_per_round": max_reads_per_round,
                 "report_char_cap": report_token_cap * 4,
+                "search_channels": prompt_channels,
             }
             if parallel_researchers > 1:
                 result = await run_heavy_research_loop(researchers=parallel_researchers, **loop_kwargs)
@@ -491,9 +609,10 @@ class DeepResearchTools(Toolkit):
                     timeout_seconds=remaining_wall_clock_seconds(),
                 )
             result.elapsed_seconds = time.monotonic() - wrapper_start
+            result.warnings = channel_warnings + result.warnings
         except Exception as exc:
             LOGGER.warning("deep_research_loop_failed", error=str(exc))
-            return _error(f"deep_research failed: {exc}")
+            return _error(f"deep_research failed: {exc}", warnings=channel_warnings)
 
         return _payload(
             "ok",
@@ -529,6 +648,18 @@ _CONFIG_FIELDS = [
         description=(
             "Search-tool function used for every query kind. Leave empty for Serper's "
             "search_web / search_news / search_scholar routing."
+        ),
+    ),
+    ConfigField(
+        name="search_channels",
+        label="Extra Search Channels",
+        type="string[]",
+        required=False,
+        default=[],
+        description=(
+            "Additional search backends the reasoner can query as search kinds. Each entry is "
+            "either a mapping with name, tool, function, and description keys, or the compact "
+            'string form "name=tool.function|description".'
         ),
     ),
 ]
