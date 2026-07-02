@@ -335,30 +335,33 @@ def _register_source(
     return record, True
 
 
+def _canonical_candidate_key(url: str) -> str:
+    return url.strip().split("#", 1)[0].rstrip("/")
+
+
 def _match_candidate(
     candidate_meta: dict[str, tuple[str, str]],
     raw_url: str,
 ) -> tuple[str, tuple[str, str]] | None:
     """Match a nominated URL to a stored candidate, tolerating fragment and trailing-slash variants.
 
-    Returns the stored candidate URL (not the nominated variant) so downstream
-    registration keys stay consistent with reads of the same page.
+    Both sides are compared in canonical form (fragment and trailing slash
+    stripped), so a variant on either the nominated or the stored URL still
+    matches. Returns the stored candidate URL (not the nominated variant) so
+    downstream registration keys stay consistent with reads of the same page.
     """
     url = raw_url.strip()
     if not url:
         return None
-    variants = [url]
-    defragmented = url.split("#", 1)[0]
-    if defragmented and defragmented != url:
-        variants.append(defragmented)
-    for variant in list(variants):
-        toggled = variant.rstrip("/") if variant.endswith("/") else variant + "/"
-        if toggled and toggled not in variants:
-            variants.append(toggled)
-    for variant in variants:
-        meta = candidate_meta.get(variant)
-        if meta is not None:
-            return variant, meta
+    meta = candidate_meta.get(url)
+    if meta is not None:
+        return url, meta
+    canonical = _canonical_candidate_key(url)
+    if not canonical:
+        return None
+    for stored_url, stored_meta in candidate_meta.items():
+        if _canonical_candidate_key(stored_url) == canonical:
+            return stored_url, stored_meta
     return None
 
 
@@ -692,15 +695,17 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     def _note_candidate(hit: SearchHit) -> str:
         url = hit.url.strip()
         considered_urls.add(url)
+        title = hit.title.strip()
+        snippet = hit.snippet.strip()
         existing = candidate_meta.get(url)
         if existing is None:
-            candidate_meta[url] = (hit.title, hit.snippet)
+            candidate_meta[url] = (title, snippet)
         else:
             # A later hit for the same URL may carry the title or snippet the
             # first one lacked; fill gaps so snippet citation stays possible.
-            title, snippet = existing
-            if (not title and hit.title) or (not snippet and hit.snippet):
-                candidate_meta[url] = (title or hit.title, snippet or hit.snippet)
+            stored_title, stored_snippet = existing
+            if (not stored_title and title) or (not stored_snippet and snippet):
+                candidate_meta[url] = (stored_title or title, stored_snippet or snippet)
         return _candidate_line(hit)
 
     seed_query = SearchQuery(query=question)

@@ -2170,6 +2170,7 @@ async def test_cite_snippet_urls_match_fragment_and_trailing_slash_variants() ->
             cite_snippet_urls=[
                 "https://a.example/page#section-2",
                 "https://b.example/docs",
+                "https://c.example/page",
             ],
         )
 
@@ -2177,6 +2178,7 @@ async def test_cite_snippet_urls_match_fragment_and_trailing_slash_variants() ->
         return [
             {"url": "https://a.example/page", "title": "A", "snippet": "fact a"},
             {"url": "https://b.example/docs/", "title": "B", "snippet": "fact b"},
+            {"url": "https://c.example/page#ref", "title": "C", "snippet": "fact c"},
         ]
 
     result = await loop.run_research_loop(
@@ -2190,11 +2192,13 @@ async def test_cite_snippet_urls_match_fragment_and_trailing_slash_variants() ->
         synthesize_fn=_synthesize,
     )
 
-    assert result.stats["snippet_sources_registered"] == 2
-    # Registered under the stored candidate URLs, not the nominated variants.
+    assert result.stats["snippet_sources_registered"] == 3
+    # Registered under the stored candidate URLs, not the nominated variants;
+    # a fragment on the stored side matches a defragmented nomination too.
     assert [source["url"] for source in result.sources] == [
         "https://a.example/page",
         "https://b.example/docs/",
+        "https://c.example/page#ref",
     ]
 
 
@@ -2229,7 +2233,8 @@ async def test_candidate_snippet_upgrades_when_a_later_hit_fills_the_gap() -> No
         nonlocal search_calls
         search_calls += 1
         if search_calls == 1:
-            return [{"url": "https://primary.example/press", "title": "", "snippet": ""}]
+            # Whitespace-only metadata must not block the later gap-fill.
+            return [{"url": "https://primary.example/press", "title": " ", "snippet": "  "}]
         return [{"url": "https://primary.example/press", "title": "Primary PR", "snippet": "The launch happened."}]
 
     result = await loop.run_research_loop(
