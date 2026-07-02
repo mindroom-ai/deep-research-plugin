@@ -1548,7 +1548,7 @@ async def test_heavy_mode_merges_sources_and_remaps_citations() -> None:
     synthesize_prompts: list[str] = []
 
     async def reason(prompt: str) -> Any:
-        key = "b" if "primary sources" in prompt else "a"
+        key = "b" if "official data, original documents" in prompt else "a"
         counts[key] += 1
         if counts[key] == 1:
             return loop.ResearchStep(
@@ -1707,7 +1707,7 @@ async def test_heavy_mode_shares_reads_and_extractions_across_researchers() -> N
     extract_calls = 0
 
     async def reason(prompt: str) -> Any:
-        key = "b" if "primary sources" in prompt else "a"
+        key = "b" if "official data, original documents" in prompt else "a"
         counts[key] += 1
         if counts[key] == 1:
             return loop.ResearchStep(
@@ -1965,3 +1965,125 @@ async def test_heavy_mode_assigns_distinct_angles_to_researchers() -> None:
 
 async def _await(value: Any) -> Any:
     return value
+
+
+@pytest.mark.asyncio
+async def test_cite_snippet_urls_register_unvetted_citable_sources_before_finish() -> None:
+    async def reason(_prompt: str) -> Any:
+        return loop.ResearchStep(
+            thought="the seed snippets already corroborate the answer",
+            updated_report="answer [1]",
+            open_questions=[],
+            confidence=0.5,
+            next_action="finish",
+            cite_snippet_urls=["https://primary.example/press", "https://unknown.example/never-seen"],
+        )
+
+    async def search(_query: Any, _limit: int) -> list[Any]:
+        return [
+            {"url": "https://primary.example/press", "title": "Primary PR", "snippet": "The launch happened."},
+            {"url": "https://nosnippet.example/page", "title": "No snippet", "snippet": ""},
+        ]
+
+    async def synthesize(prompt: str) -> str:
+        assert "Unvetted search snippet: The launch happened." in prompt
+        return "answer [1]\n\n## Sources\n[1] Primary PR - https://primary.example/press"
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=3,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=search,
+        read_fn=_unused_read,
+        synthesize_fn=synthesize,
+    )
+
+    assert result.stopped_reason == "model_finished"
+    assert result.stats["snippet_sources_registered"] == 1
+    assert [source["url"] for source in result.sources] == ["https://primary.example/press"]
+    assert result.sources[0]["snippet"] == "The launch happened."
+    assert result.sources_used == 1
+    assert result.stats["reads"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cite_snippet_urls_ignore_unknown_and_snippetless_and_cap_per_round() -> None:
+    candidate_urls = [f"https://site{i}.example/a" for i in range(8)]
+
+    async def reason(_prompt: str) -> Any:
+        return loop.ResearchStep(
+            thought="promote everything",
+            updated_report="report",
+            open_questions=[],
+            confidence=0.1,
+            next_action="finish",
+            cite_snippet_urls=[*candidate_urls, "https://hallucinated.example/x", "https://nosnippet.example/y"],
+        )
+
+    async def search(_query: Any, _limit: int) -> list[Any]:
+        return [
+            *({"url": url, "title": "t", "snippet": f"fact {url}"} for url in candidate_urls),
+            {"url": "https://nosnippet.example/y", "title": "t", "snippet": " "},
+        ]
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=2,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=search,
+        read_fn=_unused_read,
+        synthesize_fn=_synthesize,
+    )
+
+    assert result.stats["snippet_sources_registered"] == loop.SNIPPET_SOURCES_PER_ROUND_CAP
+    assert len(result.sources) == loop.SNIPPET_SOURCES_PER_ROUND_CAP
+    assert all(source["url"] in candidate_urls for source in result.sources)
+
+
+@pytest.mark.asyncio
+async def test_snippet_source_registration_counts_as_progress() -> None:
+    calls = 0
+
+    async def reason(_prompt: str) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return loop.ResearchStep(
+                thought="register a snippet source, keep searching the same query",
+                updated_report="report",
+                open_questions=[],
+                confidence=0.1,
+                next_action="search",
+                search_queries=[loop.SearchQuery(query="q")],
+                cite_snippet_urls=["https://primary.example/press"],
+            )
+        return loop.ResearchStep(
+            thought="nothing new",
+            updated_report="report",
+            open_questions=[],
+            confidence=0.1,
+            next_action="search",
+            search_queries=[loop.SearchQuery(query="q")],
+        )
+
+    async def search(_query: Any, _limit: int) -> list[Any]:
+        return [{"url": "https://primary.example/press", "title": "Primary PR", "snippet": "The launch happened."}]
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=10,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=_unused_extract,
+        search_fn=search,
+        read_fn=_unused_read,
+        synthesize_fn=_synthesize,
+    )
+
+    assert result.stats["snippet_sources_registered"] == 1
+    assert result.stopped_reason == "no_progress"
+    assert calls > 2

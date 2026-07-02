@@ -72,6 +72,14 @@ Decide next_action:
 - finish: when the report can answer the question.
 You may provide both search_queries and read_urls in the same round; both run
 before the next round unless next_action is finish.
+
+When choosing read_urls, prefer primary sources (official announcements,
+papers, original documentation) over secondary coverage. If a candidate's
+snippet already supports a claim you rely on but a full read is not worth the
+budget, list its URL in cite_snippet_urls: it is registered as a citable
+source from its snippet alone, marked unvetted. This also works in the same
+round as finish, so register snippet-backed corroborating sources before
+finishing rather than leaving them uncited.
 """
 
 
