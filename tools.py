@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 from collections.abc import Callable
@@ -14,6 +15,7 @@ from agno.tools import Toolkit
 from mindroom.logging_config import get_logger
 from mindroom.model_loading import get_model_instance
 from mindroom.tool_system.metadata import (
+    ConfigField,
     SetupType,
     ToolCategory,
     ToolStatus,
@@ -49,6 +51,8 @@ from .loop import (
 
 LOGGER = get_logger(__name__)
 TOOL_NAME = "deep_research"
+DEFAULT_SEARCH_TOOL = "serper"
+SERPER_SEARCH_FUNCTIONS = {"web": "search_web", "news": "search_news", "scholar": "search_scholar"}
 DEFAULT_MAX_ROUNDS = MAX_ROUNDS_CAP
 DEFAULT_WALL_CLOCK_SECONDS = WALL_CLOCK_SECONDS_CAP
 DEFAULT_MAX_QUERIES_PER_ROUND = MAX_QUERIES_PER_ROUND
@@ -141,12 +145,14 @@ def _parse_search_results(raw: str) -> list[SearchHit]:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
         return []
-    if not isinstance(parsed, dict) or parsed.get("error"):
-        if isinstance(parsed, dict) and parsed.get("error"):
-            raise RuntimeError(str(parsed["error"]))
+    if not isinstance(parsed, dict):
         return []
+    error = parsed.get("error")
+    if error or str(parsed.get("status") or "").lower() == "error":
+        detail = error or parsed.get("message") or parsed.get("description") or parsed.get("code")
+        raise RuntimeError(str(detail or "search failed"))
     rows: list[object] = []
-    for key in ("organic", "news", "articles", "scholar", "results"):
+    for key in ("organic", "news", "articles", "scholar", "results", "sources", "items"):
         value = parsed.get(key)
         if isinstance(value, list):
             rows.extend(value)
@@ -154,11 +160,13 @@ def _parse_search_results(raw: str) -> list[SearchHit]:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        url = row.get("link") or row.get("url")
+        url = row.get("link") or row.get("url") or row.get("uri")
         if not isinstance(url, str) or not url:
             continue
         title = str(row.get("title") or row.get("name") or url)
-        snippet = str(row.get("snippet") or row.get("description") or row.get("summary") or "")
+        snippet = str(
+            row.get("snippet") or row.get("description") or row.get("summary") or row.get("domain") or "",
+        )
         hits.append(SearchHit(url=url, title=title, snippet=snippet))
     return hits
 
@@ -180,6 +188,45 @@ def _tool_function_entrypoint(toolkit: object, function_name: str) -> Callable[.
 async def _call_tool_function(toolkit: object, function_name: str, *args: object, **kwargs: object) -> str:
     raw = await asyncio.to_thread(_tool_function_entrypoint(toolkit, function_name), *args, **kwargs)
     return raw if isinstance(raw, str) else str(raw)
+
+
+def _accepts_keyword(function: Callable[..., object], name: str) -> bool:
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return True
+    if name in parameters:
+        return True
+    return any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+
+
+async def _call_search_function(toolkit: object, function_name: str, query: str, *, num_results: int) -> str:
+    entrypoint = _tool_function_entrypoint(toolkit, function_name)
+    kwargs: dict[str, object] = {"num_results": num_results} if _accepts_keyword(entrypoint, "num_results") else {}
+    if inspect.iscoroutinefunction(entrypoint):
+        raw = await entrypoint(query, **kwargs)
+    else:
+        raw = await asyncio.to_thread(entrypoint, query, **kwargs)
+        if inspect.isawaitable(raw):
+            raw = await raw
+    return raw if isinstance(raw, str) else str(raw)
+
+
+def _tool_entry_field(entry: object, field: str) -> object:
+    if isinstance(entry, dict):
+        return entry.get(field)
+    return getattr(entry, field, None)
+
+
+def _authored_tool_overrides(context: object, tool_name: str) -> dict[str, object]:
+    """Return the calling agent's authored config overrides for one tool."""
+    agents = getattr(getattr(context, "config", None), "agents", None)
+    agent = agents.get(getattr(context, "agent_name", None)) if isinstance(agents, dict) else None
+    for entry in getattr(agent, "tools", None) or []:
+        if _tool_entry_field(entry, "name") == tool_name:
+            overrides = _tool_entry_field(entry, "overrides")
+            return dict(overrides) if isinstance(overrides, dict) else {}
+    return {}
 
 
 async def _emit_message(context: object, text: str, *, timeout_seconds: float = PROGRESS_EMIT_TIMEOUT_SECONDS) -> None:
@@ -228,7 +275,10 @@ def _format_round_progress(event: dict[str, object], *, verbose: bool) -> str:
 class DeepResearchTools(Toolkit):
     """Toolkit exposing bounded web research as one MindRoom tool."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, search_tool: str | None = None, search_function: str | None = None) -> None:
+        self.search_tool = (search_tool or "").strip() if isinstance(search_tool, str) else ""
+        self.search_tool = self.search_tool or DEFAULT_SEARCH_TOOL
+        self.search_function = (search_function or "").strip() if isinstance(search_function, str) else ""
         super().__init__(
             name=TOOL_NAME,
             instructions=(
@@ -322,17 +372,26 @@ class DeepResearchTools(Toolkit):
             LOGGER.warning("deep_research_model_resolution_failed", error=str(exc))
             return _error(str(exc))
 
+        search_tool_name = self.search_tool
         try:
-            serper = get_tool_by_name(
-                "serper",
+            search_overrides = _authored_tool_overrides(context, search_tool_name)
+            search_toolkit = get_tool_by_name(
+                search_tool_name,
                 context.runtime_paths,
+                tool_config_overrides=search_overrides or None,
                 worker_target=None,
             )
         except Exception as exc:
-            LOGGER.warning("deep_research_serper_unavailable", error=str(exc))
-            return _error("Serper is not configured or unavailable. Configure the Serper tool to use deep_research.")
-        if hasattr(serper, "api_key") and not getattr(serper, "api_key", None):
-            return _error("Serper is not configured. Configure the Serper API key to use deep_research.")
+            LOGGER.warning("deep_research_search_tool_unavailable", search_tool=search_tool_name, error=str(exc))
+            return _error(
+                f"Search tool '{search_tool_name}' is not configured or unavailable. "
+                "Configure it to use deep_research.",
+            )
+        if hasattr(search_toolkit, "api_key") and not getattr(search_toolkit, "api_key", None):
+            return _error(
+                f"Search tool '{search_tool_name}' is not configured. "
+                "Configure its API key to use deep_research.",
+            )
 
         try:
             website = get_tool_by_name(
@@ -380,12 +439,8 @@ class DeepResearchTools(Toolkit):
             return content if isinstance(content, str) else str(content)
 
         async def search_fn(query: SearchQuery, limit: int) -> list[SearchHit]:
-            search_method = {
-                "web": "search_web",
-                "news": "search_news",
-                "scholar": "search_scholar",
-            }[query.kind]
-            raw = await _call_tool_function(serper, search_method, query.query, num_results=limit)
+            search_method = self.search_function or SERPER_SEARCH_FUNCTIONS[query.kind]
+            raw = await _call_search_function(search_toolkit, search_method, query.query, num_results=limit)
             return _parse_search_results(raw)
 
         async def read_fn(url: str) -> Page:
@@ -456,18 +511,43 @@ class DeepResearchTools(Toolkit):
         )
 
 
+_CONFIG_FIELDS = [
+    ConfigField(
+        name="search_tool",
+        label="Search Tool",
+        type="text",
+        required=False,
+        default=DEFAULT_SEARCH_TOOL,
+        description="Registered MindRoom tool used for web search. Defaults to the built-in Serper tool.",
+    ),
+    ConfigField(
+        name="search_function",
+        label="Search Function",
+        type="text",
+        required=False,
+        default="",
+        description=(
+            "Search-tool function used for every query kind. Leave empty for Serper's "
+            "search_web / search_news / search_scholar routing."
+        ),
+    ),
+]
+
+
 @register_tool_with_metadata(
     name=TOOL_NAME,
     display_name="Deep Research",
     description=(
         "Run a bounded cited web-research loop using the caller's active MindRoom model. "
-        "Requires the built-in Serper tool to be configured."
+        "Requires a configured web-search tool (the built-in Serper tool by default)."
     ),
     category=ToolCategory.RESEARCH,
     status=ToolStatus.REQUIRES_CONFIG,
     setup_type=SetupType.API_KEY,
     icon="FaSearchengin",
     icon_color="text-blue-600",
+    config_fields=_CONFIG_FIELDS,
+    agent_override_fields=_CONFIG_FIELDS,
 )
 def deep_research_factory() -> type[DeepResearchTools]:
     """Factory function for the deep-research toolkit."""

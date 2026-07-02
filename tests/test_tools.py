@@ -834,8 +834,147 @@ async def test_serper_unconfigured_returns_clear_error() -> None:
         result = json.loads(await tools.deep_research("What?"))
 
     assert result["status"] == "error"
-    assert "Serper is not configured" in result["message"]
+    assert "Search tool 'serper' is not configured" in result["message"]
     loop_mock.assert_not_called()
+
+
+def test_parse_search_results_raises_on_status_error_payload() -> None:
+    module = _load_tools_module()
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        module._parse_search_results(json.dumps({"status": "error", "message": "rate limited"}))
+    with pytest.raises(RuntimeError, match="RATE_LIMIT"):
+        module._parse_search_results(json.dumps({"status": "error", "code": "RATE_LIMIT"}))
+
+
+@pytest.mark.asyncio
+async def test_custom_search_backend_serves_all_query_kinds() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools(search_tool="grounded_search", search_function="search_public_web")
+    queries: list[str] = []
+
+    class GroundedSearch:
+        def search_public_web(self, query: str) -> str:
+            queries.append(query)
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "answer": "grounded answer",
+                    "sources": [{"uri": "https://example.com/a", "title": "A", "domain": "example.com"}],
+                },
+            )
+
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
+        if name == "grounded_search":
+            return GroundedSearch()
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    async def fake_loop(**kwargs: Any) -> Any:
+        loop = _load_loop_module()
+        for kind in ("web", "news", "scholar"):
+            hits = await kwargs["search_fn"](loop.SearchQuery(query=f"{kind} q", kind=kind), 5)
+            assert hits[0].url == "https://example.com/a"
+            assert hits[0].title == "A"
+            assert hits[0].snippet == "example.com"
+        return _result(module)
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", side_effect=fake_loop),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+    assert queries == ["web q", "news q", "scholar q"]
+
+
+@pytest.mark.asyncio
+async def test_custom_async_search_function_is_awaited() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools(search_tool="grounded_search", search_function="search_public_web")
+
+    class AsyncGroundedSearch:
+        async def search_public_web(self, query: str) -> str:
+            return json.dumps({"sources": [{"uri": "https://example.com/async", "title": query}]})
+
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
+        if name == "grounded_search":
+            return AsyncGroundedSearch()
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    async def fake_loop(**kwargs: Any) -> Any:
+        hits = await kwargs["search_fn"](_load_loop_module().SearchQuery(query="async q"), 5)
+        assert hits[0].url == "https://example.com/async"
+        assert hits[0].title == "async q"
+        return _result(module)
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", side_effect=fake_loop),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_search_tool_resolution_uses_calling_agents_authored_overrides() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools(search_tool="grounded_search", search_function="search_public_web")
+    context = _tool_context(sender=AsyncMock())
+    context.config.agents = {
+        "code": SimpleNamespace(
+            tools=[SimpleNamespace(name="grounded_search", overrides={"project_id": "demo-project"})],
+        ),
+    }
+    calls: list[tuple[str, Any]] = []
+
+    class GroundedSearch:
+        def search_public_web(self, _query: str) -> str:
+            return json.dumps({"sources": []})
+
+    def tool_by_name(name: str, *_args: Any, **kwargs: Any) -> Any:
+        calls.append((name, kwargs.get("tool_config_overrides")))
+        if name == "grounded_search":
+            return GroundedSearch()
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    with (
+        tool_runtime_context(context),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+    assert ("grounded_search", {"project_id": "demo-project"}) in calls
+
+
+def test_authored_tool_overrides_accepts_object_and_dict_entries() -> None:
+    module = _load_tools_module()
+    entries = [
+        SimpleNamespace(name="object_search", overrides={"project_id": "object-project"}),
+        {"name": "dict_search", "overrides": {"project_id": "dict-project"}},
+    ]
+    context = SimpleNamespace(agent_name="code", config=SimpleNamespace(agents={"code": SimpleNamespace(tools=entries)}))
+
+    assert module._authored_tool_overrides(context, "object_search") == {"project_id": "object-project"}
+    assert module._authored_tool_overrides(context, "dict_search") == {"project_id": "dict-project"}
+    assert module._authored_tool_overrides(context, "unlisted_search") == {}
 
 
 @pytest.mark.skipif(
