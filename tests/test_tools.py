@@ -1391,3 +1391,49 @@ def test_result_text_unwraps_string_and_block_list_content_conservatively() -> N
     assert module._result_text(StrContent()) == '{"results": []}'
     assert module._result_text(BlockContent()) == '{"documents": []}\nsecond block'
     assert module._result_text(UnrelatedContent()) == "plain repr"
+
+
+def test_parse_search_channels_accepts_json_object_strings() -> None:
+    module = _load_tools_module()
+
+    channels = module._parse_search_channels(
+        [
+            '{"name": "wiki", "tool": "mcp_wiki", "function": "wiki_call_tool", "description": "Internal wiki", '
+            '"arguments": {"tool_name": "list_documents", "arguments": {"query": "{query}", "limit": "{num_results}"}}}',
+            '{"name": "chat", "tool": "chat_tool", "function": "search_messages"}',
+        ],
+    )
+
+    assert [channel["name"] for channel in channels] == ["wiki", "chat"]
+    assert channels[0]["arguments"] == {
+        "tool_name": "list_documents",
+        "arguments": {"query": "{query}", "limit": "{num_results}"},
+    }
+    assert channels[1]["arguments"] is None
+
+
+def test_parse_search_channels_reparses_comma_joined_runtime_string() -> None:
+    module = _load_tools_module()
+
+    # MindRoom's per-agent override path joins string[] values with ", "
+    # before they reach the constructor; commas inside quoted JSON values
+    # must not break the re-parse.
+    joined = ", ".join(
+        [
+            '{"name": "wiki", "tool": "mcp_wiki", "function": "wiki_call_tool", "description": "Runbooks, docs, and more"}',
+            '{"name": "chat", "tool": "chat_tool", "function": "search_messages"}',
+        ],
+    )
+
+    channels = module._parse_search_channels(joined)
+
+    assert [channel["name"] for channel in channels] == ["wiki", "chat"]
+    assert channels[0]["description"] == "Runbooks, docs, and more"
+
+
+def test_parse_search_channels_drops_malformed_json_strings_without_crashing() -> None:
+    module = _load_tools_module()
+
+    channels = module._parse_search_channels(['{"name": "broken"', "chat=chat_tool.search|Chat"])
+
+    assert [channel["name"] for channel in channels] == ["chat"]
