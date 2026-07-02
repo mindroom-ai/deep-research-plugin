@@ -38,12 +38,14 @@ def reasoner_prompt(
     fetched_urls: Sequence[str] = (),
     angle: str = "",
     search_channels: Sequence[tuple[str, str]] = (),
+    open_questions: Sequence[str] = (),
 ) -> str:
     """Build the structured reasoner prompt."""
     evidence_text = "\n".join(f"- {item}" for item in pending_evidence) or "- (no new evidence)"
     sources_text = "\n".join(f"- {item}" for item in sources) or "- (no sources yet)"
     queries_text = "\n".join(f"- {item}" for item in recent_queries) or "- (none yet)"
     fetched_text = "\n".join(f"- {item}" for item in fetched_urls) or "- (none yet)"
+    open_questions_text = "\n".join(f"- {item}" for item in open_questions) or "- (none)"
     channels_text = "\n".join(f"- {name}: {description}" for name, description in search_channels) or "\n".join(
         f"- {name}: {description}" for name, description in BASE_CHANNEL_DESCRIPTIONS.items()
     )
@@ -69,6 +71,10 @@ Search queries already executed (repeats are skipped, so plan new angles):
 URLs already fetched (repeats are skipped, so request new ones):
 {fetched_text}
 
+Open questions you flagged last round (resolve them, or drop the ones that no
+longer matter; a confident stop requires this list to be empty):
+{open_questions_text}
+
 Budget left:
 {budget_left}
 
@@ -85,7 +91,7 @@ back to the default web channel):
 Decide next_action:
 - search: when more search results are needed; provide up to {max_queries} focused queries, each with the most fitting channel as its kind.
 - read: when specific URLs should be fetched; provide up to {max_reads} URLs.
-- finish: when the report can answer the question.
+- finish: when the report can answer the question and no important open questions remain.
 You may provide both search_queries and read_urls in the same round; both run
 before the next round unless next_action is finish.
 
@@ -156,6 +162,28 @@ Requirements:
 - Include a final section exactly titled "## Sources".
 - In the sources section, list every cited source as "[n] title - URL".
 - Do not invent citations that are not in the source registry.
+"""
+
+
+def grounding_prompt(*, question: str, report: str, evidence_context: str) -> str:
+    """Build the prompt that verifies a final report's cited claims against its evidence."""
+    return f"""Check a research report's cited claims against the evidence it was written from.
+
+Question the report answers:
+{question}
+
+Report body:
+{report}
+
+Evidence the report was written from:
+{evidence_context or "(no evidence)"}
+
+Return only the requested structured object. List each claim in the report
+that carries a [n] citation but is not supported by the evidence above —
+wrong source number, wrong entity or figure, overstated certainty, or absent
+from the evidence entirely — with the cited source id and a short reason.
+Paraphrase and reasonable summarization are fine; only flag real mismatches.
+If every cited claim is supported, return issues=[].
 """
 
 

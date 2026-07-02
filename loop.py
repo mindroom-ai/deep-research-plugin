@@ -12,7 +12,13 @@ from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from .prompts import extractor_prompt, heavy_synthesize_prompt, reasoner_prompt, synthesize_prompt
+from .prompts import (
+    extractor_prompt,
+    grounding_prompt,
+    heavy_synthesize_prompt,
+    reasoner_prompt,
+    synthesize_prompt,
+)
 
 CONFIDENCE_STOP = 0.8
 MAX_ROUNDS_CAP = 100
@@ -35,7 +41,9 @@ FACTS_PER_SOURCE_CAP = 20
 EVIDENCE_DIGEST_CHAR_CAP = 20_000
 RECENT_QUERIES_PROMPT_CAP = 15
 FETCHED_URLS_PROMPT_CAP = 20
+OPEN_QUESTIONS_PROMPT_CAP = 8
 UNVETTED_EXCERPT_CHARS = 400
+GROUNDING_MIN_REMAINING_SECONDS = 45
 PARALLEL_RESEARCHERS_CAP = 4
 SYNTHESIS_RESERVE_SECONDS = 180
 LOOP_SYNTHESIS_RESERVE_SECONDS = 90
@@ -82,6 +90,20 @@ class Extraction(BaseModel):
 
     facts: list[str]
     relevant: bool
+
+
+class GroundingIssue(BaseModel):
+    """One final-report claim the grounding check could not support."""
+
+    claim: str
+    source_id: int | None = None
+    reason: str = ""
+
+
+class GroundingCheck(BaseModel):
+    """Structured grounding-check verdict over the final report."""
+
+    issues: list[GroundingIssue] = []
 
 
 class SearchHit(BaseModel):
@@ -478,12 +500,22 @@ def _candidate_line(hit: SearchHit) -> str:
     return f"Candidate URL: {title} - {hit.url}"
 
 
-def _final_workspace(report: str, pending_evidence: Sequence[str]) -> str:
+def _final_workspace(
+    report: str,
+    pending_evidence: Sequence[str],
+    open_questions: Sequence[str] = (),
+) -> str:
+    workspace = report.rstrip()
     useful_evidence = [item for item in pending_evidence if item != "(no new evidence)"]
-    if not useful_evidence:
-        return report
-    evidence_text = "\n".join(f"- {item}" for item in useful_evidence)
-    return f"{report.rstrip()}\n\nUnsynthesized evidence from the final round:\n{evidence_text}".strip()
+    if useful_evidence:
+        evidence_text = "\n".join(f"- {item}" for item in useful_evidence)
+        workspace = f"{workspace}\n\nUnsynthesized evidence from the final round:\n{evidence_text}"
+    if open_questions:
+        questions_text = "\n".join(f"- {question}" for question in open_questions)
+        workspace = (
+            f"{workspace}\n\nUnresolved questions (state explicitly what remains unknown):\n{questions_text}"
+        )
+    return workspace.strip()
 
 
 def _evidence_digest(
@@ -524,6 +556,87 @@ def _wall_clock_warning(label: str) -> str:
     return f"wall clock expired during {label}"
 
 
+def _grounding_fix_prompt(final_prompt: str, issues: Sequence[GroundingIssue], previous_report: str) -> str:
+    issue_lines = "\n".join(
+        f"- {issue.claim}"
+        + (f" (cited [{issue.source_id}])" if issue.source_id is not None else "")
+        + (f": {issue.reason}" if issue.reason else "")
+        for issue in issues
+    )
+    return (
+        f"{final_prompt}\n\nYour previous draft:\n{previous_report}\n\n"
+        f"A grounding check found claims in this draft that the "
+        f"evidence does not support:\n{issue_lines}\n\n"
+        "Rewrite the report: correct each flagged claim to match the evidence, remove its "
+        "citation, or state the uncertainty explicitly. Keep all other content and valid citations."
+    )
+
+
+async def _apply_grounding_gate(
+    *,
+    final_report: str,
+    final_prompt: str,
+    question: str,
+    grounding_context: str,
+    sources: list[dict[str, object]],
+    sources_by_url: dict[str, SourceRecord],
+    ground_fn: ExtractFn,
+    synthesize_fn: SynthesizeFn,
+    budget: _WallClockBudget,
+    warnings: list[str],
+    stats: dict[str, int] | None = None,
+) -> str:
+    """Verify cited claims against the synthesis evidence; regenerate once on failure.
+
+    Soft-fails in every direction: skipped when the budget is nearly spent,
+    an unparseable verdict counts as a pass, and a regeneration that loses
+    its citations is discarded in favor of the flagged-but-cited report.
+    """
+    if not sources_by_url:
+        return final_report
+    if budget.remaining() < GROUNDING_MIN_REMAINING_SECONDS:
+        warnings.append("grounding check skipped: wall clock nearly spent")
+        return final_report
+    try:
+        check = await _call_structured_with_retry(
+            ground_fn,
+            grounding_prompt(
+                question=question,
+                report=_report_body(final_report),
+                evidence_context=grounding_context,
+            ),
+            GroundingCheck,
+            GroundingCheck,
+            warnings,
+            "grounding check",
+            budget,
+        )
+        if not check.issues:
+            return final_report
+        if stats is not None:
+            stats["grounding_issues"] = stats.get("grounding_issues", 0) + len(check.issues)
+        claim_word = "claim" if len(check.issues) == 1 else "claims"
+        warnings.append(f"grounding check flagged {len(check.issues)} unsupported {claim_word}; regenerated")
+        revised = _ensure_sources_section(
+            await budget.wait_for(
+                "grounding regeneration",
+                lambda: synthesize_fn(_grounding_fix_prompt(final_prompt, check.issues, final_report)),
+            ),
+            sources,
+            sources_by_url,
+        )
+        if _has_valid_citations(revised, sources_by_url):
+            if stats is not None:
+                stats["grounding_regenerations"] = stats.get("grounding_regenerations", 0) + 1
+            return revised
+        warnings.append("grounding regeneration lost its citations; keeping the flagged report")
+    except _WallClockExpired as exc:
+        warnings.append(_wall_clock_warning(exc.label))
+    except Exception as exc:
+        warnings.append(f"grounding check failed: {exc}")
+    return final_report
+
+
 def _search_phase_seconds(wall_clock_seconds: int) -> int:
     """Search-phase deadline that reserves wall clock for the loop's own final synthesis."""
     reserve = min(LOOP_SYNTHESIS_RESERVE_SECONDS, max(0, wall_clock_seconds - 60) // 2)
@@ -539,8 +652,12 @@ async def _finalize_report(
     synthesize_fn: SynthesizeFn,
     budget: _WallClockBudget,
     warnings: list[str],
+    question: str = "",
+    ground_fn: ExtractFn | None = None,
+    grounding_context: str = "",
+    stats: dict[str, int] | None = None,
 ) -> tuple[str, bool]:
-    """Run final synthesis with citation repair; return (report, wall_clock_expired)."""
+    """Run final synthesis with citation repair and grounding; return (report, wall_clock_expired)."""
     try:
         final_report = _ensure_sources_section(
             await budget.wait_for("final synthesis", lambda: synthesize_fn(final_prompt)),
@@ -572,6 +689,20 @@ async def _finalize_report(
     except Exception as exc:
         warnings.append(f"final synthesis failed: {exc}")
         return _ensure_sources_section(fallback_report, sources, sources_by_url), False
+    if ground_fn is not None:
+        final_report = await _apply_grounding_gate(
+            final_report=final_report,
+            final_prompt=final_prompt,
+            question=question,
+            grounding_context=grounding_context,
+            sources=sources,
+            sources_by_url=sources_by_url,
+            ground_fn=ground_fn,
+            synthesize_fn=synthesize_fn,
+            budget=budget,
+            warnings=warnings,
+            stats=stats,
+        )
     return final_report, False
 
 
@@ -640,6 +771,7 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     max_concurrency: int = MAX_CONCURRENCY,
     angle: str = "",
     search_channels: Sequence[tuple[str, str]] = (),
+    ground_fn: ExtractFn | None = None,
 ) -> LoopResult:
     """Run the bounded research loop using injected LLM and network callables."""
     max_rounds = clamp_int(max_rounds, minimum=1, maximum=MAX_ROUNDS_CAP)
@@ -665,6 +797,9 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
         "duplicate_reads_skipped": 0,
         "read_snippet_fallbacks": 0,
         "snippet_sources_registered": 0,
+        "grounding_issues": 0,
+        "grounding_regenerations": 0,
+        "finished_with_open_questions": 0,
     }
     start = clock() if budget_start is None else budget_start
     total_budget = _WallClockBudget(start=start, seconds=wall_clock_seconds, clock=clock)
@@ -686,6 +821,7 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     candidate_meta: dict[str, tuple[str, str]] = {}
     no_progress_counter = 0
     seen_evidence: set[str] = set()
+    unresolved_questions: list[str] = []
 
     def _query_key(query: SearchQuery) -> str:
         return f"{query.kind}:{' '.join(query.query.lower().split())}"
@@ -767,6 +903,7 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
             fetched_urls=attempted_read_order[-FETCHED_URLS_PROMPT_CAP:],
             angle=angle,
             search_channels=search_channels,
+            open_questions=unresolved_questions,
         )
         fallback_step = ResearchStep(
             thought="Structured reasoner output failed; skipping this round.",
@@ -799,6 +936,12 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
             break
         report = truncate_report(step.updated_report, report_char_cap)
         confidence = step.confidence
+        # A skipped (failed-reasoner) round keeps the previous round's open
+        # questions; a real step replaces them.
+        if not reasoner_failed:
+            unresolved_questions = [
+                question_text.strip() for question_text in step.open_questions if question_text.strip()
+            ][:OPEN_QUESTIONS_PROMPT_CAP]
 
         if emit_fn is not None:
             try:
@@ -813,6 +956,7 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
                             "next_action": step.next_action,
                             "search_queries": [query.model_dump() for query in step.search_queries],
                             "read_urls": step.read_urls,
+                            "open_questions": len(unresolved_questions),
                         },
                     ),
                 )
@@ -849,10 +993,14 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
                 source_facts.append(fact)
             snippet_evidence.append(f"[{source.id}] {fact}")
 
-        if confidence >= CONFIDENCE_STOP and sources_by_url:
+        # Coverage is verified, not trusted: a confident stop additionally
+        # requires that the reasoner itself reports no open questions.
+        if confidence >= CONFIDENCE_STOP and sources_by_url and not unresolved_questions:
             stopped_reason = "confident"
             break
         if step.next_action == "finish":
+            if unresolved_questions:
+                stats["finished_with_open_questions"] += 1
             stopped_reason = "model_finished"
             break
 
@@ -1058,15 +1206,20 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
             break
 
     sources = _sources_json(sources_by_url)
+    workspace = _final_workspace(report, pending_evidence, unresolved_questions)
+    evidence_lines = _evidence_digest(facts_by_source)
     final_prompt = synthesize_prompt(
         question=question,
-        report=_final_workspace(report, pending_evidence),
+        report=workspace,
         sources=sources,
-        evidence=_evidence_digest(facts_by_source),
+        evidence=evidence_lines,
     )
-    fallback_report = _final_workspace(report, pending_evidence).strip()
+    fallback_report = workspace
     if not fallback_report:
         fallback_report = "Research stopped because the wall-clock budget expired before a final report was produced."
+    grounding_context = workspace
+    if evidence_lines:
+        grounding_context += "\n\nEvidence notes:\n" + "\n".join(f"- {line}" for line in evidence_lines)
     final_report, synthesis_expired = await _finalize_report(
         final_prompt=final_prompt,
         fallback_report=fallback_report,
@@ -1075,6 +1228,10 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
         synthesize_fn=synthesize_fn,
         budget=total_budget,
         warnings=warnings,
+        question=question,
+        ground_fn=ground_fn,
+        grounding_context=grounding_context,
+        stats=stats,
     )
     if synthesis_expired:
         stopped_reason = "synthesis_truncated"
@@ -1228,6 +1385,7 @@ async def run_heavy_research_loop(
     retry_backoff_seconds: float = RETRY_BACKOFF_SECONDS,
     max_concurrency: int = MAX_CONCURRENCY,
     search_channels: Sequence[tuple[str, str]] = (),
+    ground_fn: ExtractFn | None = None,
 ) -> LoopResult:
     """Run N research loops on different angles concurrently and synthesize one report.
 
@@ -1268,8 +1426,11 @@ async def run_heavy_research_loop(
         return await run_research_loop(
             wall_clock_seconds=wall_clock_seconds,
             budget_start=budget_start,
+            ground_fn=ground_fn,
             **researcher_kwargs(0),  # type: ignore[arg-type]
         )
+    # Researchers skip the grounding gate; only the integrated heavy report
+    # is grounded, so the gate costs at most two extra calls per run.
 
     start = clock() if budget_start is None else budget_start
     budget = _WallClockBudget(start=start, seconds=wall_clock_seconds, clock=clock)
@@ -1319,6 +1480,10 @@ async def run_heavy_research_loop(
         if body.strip()
     ).strip() or "All researchers stopped before producing findings."
 
+    stats: dict[str, int] = {}
+    for result in results:
+        for key, value in result.stats.items():
+            stats[key] = stats.get(key, 0) + value
     final_report, synthesis_expired = await _finalize_report(
         final_prompt=heavy_synthesize_prompt(question=question, reports=remapped_reports, sources=sources),
         fallback_report=fallback_report,
@@ -1327,12 +1492,14 @@ async def run_heavy_research_loop(
         synthesize_fn=synthesize_fn,
         budget=budget,
         warnings=warnings,
+        question=question,
+        ground_fn=ground_fn,
+        # The heavy report must be faithful to the researcher reports it
+        # integrates, which is exactly what the fallback concatenation holds.
+        grounding_context=fallback_report,
+        stats=stats,
     )
 
-    stats: dict[str, int] = {}
-    for result in results:
-        for key, value in result.stats.items():
-            stats[key] = stats.get(key, 0) + value
     stats["cross_researcher_reads_shared"] = shared_read_fn.hits
     stats["cross_researcher_extracts_shared"] = shared_extract_fn.hits
 
