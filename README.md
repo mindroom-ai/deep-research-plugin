@@ -112,6 +112,21 @@ agents:
 - Channel functions are called like the main search function (`fn(query)`, with `num_results` only when accepted) and must return JSON in one of the shapes above — rows need a URL (or permalink) to enter the source registry.
 - Channel tools are resolved with the calling agent's authored overrides for that tool, like the main search backend. An unavailable channel is dropped for the run and reported in the result's `warnings` instead of failing the research.
 - Channel names `web`, `news`, and `scholar` are reserved for the main backend.
+- Functions that take structured keyword arguments instead of a single query string — MCP tools in particular, including the `<prefix>_call_tool` bridge of OAuth-backed MCP servers — can be called through an `arguments` template with `{query}` and `{num_results}` placeholders. A string that is exactly one placeholder keeps the substituted value's type (so `"{num_results}"` becomes an integer):
+
+  ```yaml
+  - name: wiki
+    description: Internal documentation wiki
+    tool: mcp_my_wiki
+    function: my_wiki_call_tool
+    arguments:
+      tool_name: search_documents
+      arguments:
+        query: "{query}"
+        limit: "{num_results}"
+  ```
+
+  MCP-style result objects are unwrapped (`.content`) before parsing, and functions registered in a toolkit's `async_functions` (as MCP toolkits do) are found alongside plain `functions`.
 - Internal URLs that the native website reader cannot fetch degrade to their search snippet as unvetted sources, and the reasoner can cite snippet-backed channel hits directly via `cite_snippet_urls` — so channels remain useful even when their pages are not readable.
 - UIs that only accept strings can use the compact form `"wiki=my_wiki_tool.search_documents|Internal documentation"`.
 

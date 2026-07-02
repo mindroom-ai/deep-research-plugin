@@ -1040,8 +1040,20 @@ def test_parse_search_channels_accepts_dicts_and_compact_strings() -> None:
     )
 
     assert channels == [
-        {"name": "wiki", "tool": "wiki_tool", "function": "search_documents", "description": "Internal wiki"},
-        {"name": "chat", "tool": "chat_tool", "function": "search_messages", "description": "Team chat history"},
+        {
+            "name": "wiki",
+            "tool": "wiki_tool",
+            "function": "search_documents",
+            "description": "Internal wiki",
+            "arguments": None,
+        },
+        {
+            "name": "chat",
+            "tool": "chat_tool",
+            "function": "search_messages",
+            "description": "Team chat history",
+            "arguments": None,
+        },
     ]
 
 
@@ -1233,3 +1245,116 @@ def test_parse_search_results_skips_non_string_values_in_key_chains() -> None:
     assert hits[0].url == "https://real.example/a"
     assert hits[0].title == "Real Title"
     assert hits[0].snippet == "real snippet"
+
+
+def test_substitute_placeholders_preserves_types_and_nests() -> None:
+    module = _load_tools_module()
+
+    substituted = module._substitute_placeholders(
+        {
+            "tool_name": "search_documents",
+            "arguments": {"query": "{query}", "limit": "{num_results}", "note": "q={query} n={num_results}"},
+            "tags": ["{query}", "static"],
+            "flag": True,
+        },
+        query="ion traps",
+        num_results=7,
+    )
+
+    assert substituted == {
+        "tool_name": "search_documents",
+        "arguments": {"query": "ion traps", "limit": 7, "note": "q=ion traps n=7"},
+        "tags": ["ion traps", "static"],
+        "flag": True,
+    }
+
+
+def test_parse_search_channels_keeps_dict_arguments_only() -> None:
+    module = _load_tools_module()
+
+    channels = module._parse_search_channels(
+        [
+            {
+                "name": "wiki",
+                "tool": "mcp_wiki",
+                "function": "wiki_call_tool",
+                "arguments": {"tool_name": "search_documents", "arguments": {"query": "{query}"}},
+            },
+            {"name": "bad", "tool": "t", "function": "f", "arguments": "not a dict"},
+        ],
+    )
+
+    assert channels[0]["arguments"] == {"tool_name": "search_documents", "arguments": {"query": "{query}"}}
+    assert channels[1]["arguments"] is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_bridge_channel_uses_arguments_template_async_functions_and_content_unwrap() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools(
+        search_tool="grounded_search",
+        search_function="search_public_web",
+        search_channels=[
+            {
+                "name": "wiki",
+                "tool": "mcp_wiki",
+                "function": "wiki_call_tool",
+                "description": "Internal wiki",
+                "arguments": {
+                    "tool_name": "search_documents",
+                    "arguments": {"query": "{query}", "limit": "{num_results}"},
+                },
+            },
+        ],
+    )
+    bridge_calls: list[dict[str, Any]] = []
+
+    class FakeToolResult:
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    class McpWiki:
+        def __init__(self) -> None:
+            async def bridge(*, tool_name: str, arguments: dict[str, Any]) -> FakeToolResult:
+                bridge_calls.append({"tool_name": tool_name, "arguments": arguments})
+                return FakeToolResult(
+                    json.dumps(
+                        {"documents": [{"url": "https://wiki.example/doc/1", "title": "Doc", "context": "wiki fact"}]},
+                    ),
+                )
+
+            # MCP toolkits register functions in async_functions, not functions.
+            self.async_functions = {"wiki_call_tool": _entrypoint(bridge)}
+
+    class GroundedSearch:
+        def search_public_web(self, _query: str) -> str:
+            return json.dumps({"sources": []})
+
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
+        if name == "grounded_search":
+            return GroundedSearch()
+        if name == "mcp_wiki":
+            return McpWiki()
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    async def fake_loop(**kwargs: Any) -> Any:
+        hits = await kwargs["search_fn"](_load_loop_module().SearchQuery(query="frobnicator runbook", kind="wiki"), 5)
+        assert hits[0].url == "https://wiki.example/doc/1"
+        assert hits[0].snippet == "wiki fact"
+        return _result(module)
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", side_effect=fake_loop),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+    assert bridge_calls == [
+        {"tool_name": "search_documents", "arguments": {"query": "frobnicator runbook", "limit": 5}},
+    ]

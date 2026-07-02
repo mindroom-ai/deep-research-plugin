@@ -57,22 +57,27 @@ SERPER_SEARCH_FUNCTIONS = {"web": "search_web", "news": "search_news", "scholar"
 HIT_SNIPPET_CHAR_LIMIT = 500
 
 
-def _parse_search_channels(raw: object) -> list[dict[str, str]]:
+def _parse_search_channels(raw: object) -> list[dict[str, object]]:
     """Normalize authored search_channels config into channel dicts.
 
-    Accepts structured entries ({name, tool, function, description}) and the
-    compact string form "name=tool.function|description" (for UIs that only
-    take strings). Invalid entries and names that shadow the built-in
-    web/news/scholar channels are dropped with a warning.
+    Accepts structured entries ({name, tool, function, description}, plus an
+    optional arguments template with {query}/{num_results} placeholders for
+    functions that take structured kwargs, e.g. MCP tools) and the compact
+    string form "name=tool.function|description" (for UIs that only take
+    strings; no arguments template). Invalid entries and names that shadow
+    the built-in web/news/scholar channels are dropped with a warning.
     """
-    channels: list[dict[str, str]] = []
+    channels: list[dict[str, object]] = []
     seen_names: set[str] = set()
     for entry in raw if isinstance(raw, list) else []:
+        arguments: dict[str, object] | None = None
         if isinstance(entry, dict):
             name = str(entry.get("name") or "").strip().lower()
             tool = str(entry.get("tool") or "").strip()
             function = str(entry.get("function") or "").strip()
             description = str(entry.get("description") or "").strip()
+            raw_arguments = entry.get("arguments")
+            arguments = raw_arguments if isinstance(raw_arguments, dict) else None
         elif isinstance(entry, str):
             head, _, description = entry.partition("|")
             name, _, target = head.partition("=")
@@ -97,6 +102,7 @@ def _parse_search_channels(raw: object) -> list[dict[str, str]]:
                 "tool": tool,
                 "function": function,
                 "description": description or f"search via the {tool} tool",
+                "arguments": arguments,
             },
         )
     return channels
@@ -231,12 +237,14 @@ def _parse_search_results(raw: str) -> list[SearchHit]:
 
 
 def _tool_function_entrypoint(toolkit: object, function_name: str) -> Callable[..., object]:
-    functions = getattr(toolkit, "functions", {})
-    if isinstance(functions, dict):
-        function = functions.get(function_name)
-        entrypoint = getattr(function, "entrypoint", None)
-        if callable(entrypoint):
-            return entrypoint
+    # MCP-backed toolkits register their functions in async_functions.
+    for functions_attr in ("functions", "async_functions"):
+        functions = getattr(toolkit, functions_attr, {})
+        if isinstance(functions, dict):
+            function = functions.get(function_name)
+            entrypoint = getattr(function, "entrypoint", None)
+            if callable(entrypoint):
+                return entrypoint
     fallback = getattr(toolkit, function_name, None)
     if callable(fallback):
         return fallback
@@ -259,15 +267,52 @@ def _accepts_keyword(function: Callable[..., object], name: str) -> bool:
     return any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
 
 
-async def _call_search_function(toolkit: object, function_name: str, query: str, *, num_results: int) -> str:
+def _substitute_placeholders(value: object, *, query: str, num_results: int) -> object:
+    """Fill {query}/{num_results} placeholders in an arguments template.
+
+    A string that is exactly one placeholder keeps the substituted value's
+    type (so "{num_results}" becomes an int); placeholders embedded in longer
+    strings are replaced textually.
+    """
+    if isinstance(value, str):
+        if value == "{query}":
+            return query
+        if value == "{num_results}":
+            return num_results
+        return value.replace("{query}", query).replace("{num_results}", str(num_results))
+    if isinstance(value, dict):
+        return {key: _substitute_placeholders(item, query=query, num_results=num_results) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_substitute_placeholders(item, query=query, num_results=num_results) for item in value]
+    return value
+
+
+async def _call_search_function(
+    toolkit: object,
+    function_name: str,
+    query: str,
+    *,
+    num_results: int,
+    arguments: dict[str, object] | None = None,
+) -> str:
     entrypoint = _tool_function_entrypoint(toolkit, function_name)
-    kwargs: dict[str, object] = {"num_results": num_results} if _accepts_keyword(entrypoint, "num_results") else {}
-    if inspect.iscoroutinefunction(entrypoint):
-        raw = await entrypoint(query, **kwargs)
+    if arguments is not None:
+        # Keyword-shaped call for functions that take structured kwargs
+        # (e.g. MCP tools); the template carries the query placement.
+        args: tuple[object, ...] = ()
+        substituted = _substitute_placeholders(arguments, query=query, num_results=num_results)
+        kwargs = substituted if isinstance(substituted, dict) else {}
     else:
-        raw = await asyncio.to_thread(entrypoint, query, **kwargs)
+        args = (query,)
+        kwargs = {"num_results": num_results} if _accepts_keyword(entrypoint, "num_results") else {}
+    if inspect.iscoroutinefunction(entrypoint):
+        raw = await entrypoint(*args, **kwargs)
+    else:
+        raw = await asyncio.to_thread(entrypoint, *args, **kwargs)
         if inspect.isawaitable(raw):
             raw = await raw
+    # MCP tool calls return result objects whose text lives in .content.
+    raw = getattr(raw, "content", raw)
     return raw if isinstance(raw, str) else str(raw)
 
 
@@ -485,10 +530,12 @@ class DeepResearchTools(Toolkit):
                 )
                 channel_warnings.append(f"search channel '{channel_name}' unavailable: {exc}")
                 continue
+            channel_arguments = channel_config.get("arguments")
             channels[channel_name] = {
                 "toolkit": channel_toolkit,
                 "function": channel_function,
                 "description": str(channel_config["description"]),
+                "arguments": channel_arguments if isinstance(channel_arguments, dict) else None,
             }
 
         if self.search_function:
@@ -545,11 +592,13 @@ class DeepResearchTools(Toolkit):
         async def search_fn(query: SearchQuery, limit: int) -> list[SearchHit]:
             channel = channels.get(query.kind)
             if channel is not None:
+                channel_arguments = channel["arguments"]
                 raw = await _call_search_function(
                     channel["toolkit"],
                     str(channel["function"]),
                     query.query,
                     num_results=limit,
+                    arguments=channel_arguments if isinstance(channel_arguments, dict) else None,
                 )
             else:
                 search_method = (
