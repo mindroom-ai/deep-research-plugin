@@ -69,6 +69,28 @@ HIT_SNIPPET_CHAR_LIMIT = 500
 _PLACEHOLDER_RE = re.compile(r"\{query\}|\{num_results\}")
 
 
+class _ChannelConfig(BaseModel):
+    """One authored search channel: a named tool+function evidence backend."""
+
+    name: str
+    tool: str
+    function: str
+    description: str = ""
+    arguments: dict[str, object] | None = None
+
+    @model_validator(mode="after")
+    def _normalize(self) -> _ChannelConfig:
+        object.__setattr__(self, "name", self.name.strip().lower())
+        object.__setattr__(self, "tool", self.tool.strip())
+        object.__setattr__(self, "function", self.function.strip())
+        description = self.description.strip() or f"search via the {self.tool} tool"
+        object.__setattr__(self, "description", description)
+        if not self.name or not self.tool or not self.function:
+            msg = "channel entries need name, tool, and function"
+            raise ValueError(msg)
+        return self
+
+
 def _coerce_channel_entries(raw: object) -> list[object]:
     """Expand raw channel config into a list of entry objects.
 
