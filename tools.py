@@ -9,9 +9,14 @@ import json
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from agno.agent import Agent
 from agno.tools import Toolkit
+from agno.tools.function import ToolResult
+from agno.tools.serper import SerperTools
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 from mindroom.logging_config import get_logger
 from mindroom.model_loading import get_model_instance
@@ -28,7 +33,10 @@ from mindroom.tool_system.runtime_context import (
     get_tool_runtime_context,
     resolve_tool_runtime_hook_bindings,
 )
-from mindroom.tool_system.worker_routing import build_worker_target_from_runtime_env
+
+if TYPE_CHECKING:
+    from mindroom.tool_system.runtime_context import ToolRuntimeContext
+    from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 from .prompts import BASE_CHANNEL_DESCRIPTIONS
 from .loop import (
@@ -59,6 +67,39 @@ DEFAULT_SEARCH_TOOL = "serper"
 SERPER_SEARCH_FUNCTIONS = {"web": "search_web", "news": "search_news", "scholar": "search_scholar"}
 HIT_SNIPPET_CHAR_LIMIT = 500
 _PLACEHOLDER_RE = re.compile(r"\{query\}|\{num_results\}")
+
+
+class _ChannelConfig(BaseModel):
+    """One authored search channel: a named tool+function evidence backend."""
+
+    name: str
+    tool: str
+    function: str
+    description: str = ""
+    arguments: dict[str, object] | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _normalize_name(cls, value: str) -> str:
+        name = value.strip().lower()
+        if not name:
+            msg = "channel name must not be empty"
+            raise ValueError(msg)
+        return name
+
+    @field_validator("tool", "function")
+    @classmethod
+    def _require_identifier(cls, value: str) -> str:
+        identifier = value.strip()
+        if not identifier:
+            msg = "channel entries need name, tool, and function"
+            raise ValueError(msg)
+        return identifier
+
+    @model_validator(mode="after")
+    def _default_description(self) -> _ChannelConfig:
+        self.description = self.description.strip() or f"search via the {self.tool} tool"
+        return self
 
 
 def _coerce_channel_entries(raw: object) -> list[object]:
@@ -99,8 +140,8 @@ def _coerce_channel_entries(raw: object) -> list[object]:
     return entries
 
 
-def _parse_search_channels(raw: object) -> list[dict[str, object]]:
-    """Normalize authored search_channels config into channel dicts.
+def _parse_search_channels(raw: object) -> list[_ChannelConfig]:
+    """Validate authored search_channels config into typed channel configs.
 
     Accepts structured entries ({name, tool, function, description}, plus an
     optional arguments template with {query}/{num_results} placeholders for
@@ -111,45 +152,42 @@ def _parse_search_channels(raw: object) -> list[dict[str, object]]:
     entries and names that shadow the built-in web/news/scholar channels are
     dropped with a warning.
     """
-    channels: list[dict[str, object]] = []
+    channels: list[_ChannelConfig] = []
     seen_names: set[str] = set()
     for entry in _coerce_channel_entries(raw):
-        arguments: dict[str, object] | None = None
-        if isinstance(entry, dict):
-            name = str(entry.get("name") or "").strip().lower()
-            tool = str(entry.get("tool") or "").strip()
-            function = str(entry.get("function") or "").strip()
-            description = str(entry.get("description") or "").strip()
-            raw_arguments = entry.get("arguments")
-            arguments = raw_arguments if isinstance(raw_arguments, dict) else None
-        elif isinstance(entry, str):
+        if isinstance(entry, str):
             head, _, description = entry.partition("|")
             name, _, target = head.partition("=")
             tool, _, function = target.strip().partition(".")
-            name = name.strip().lower()
-            tool = tool.strip()
-            function = function.strip()
-            description = description.strip()
-        else:
-            LOGGER.warning("deep_research_search_channel_invalid", entry=repr(entry))
-            continue
-        if not name or not tool or not function:
-            LOGGER.warning("deep_research_search_channel_incomplete", entry=repr(entry))
-            continue
-        if name in BASE_CHANNEL_DESCRIPTIONS or name in seen_names:
-            LOGGER.warning("deep_research_search_channel_name_conflict", channel=name)
-            continue
-        seen_names.add(name)
-        channels.append(
-            {
+            candidate: object = {
                 "name": name,
                 "tool": tool,
                 "function": function,
-                "description": description or f"search via the {tool} tool",
-                "arguments": arguments,
-            },
-        )
+                "description": description.strip(),
+            }
+        else:
+            candidate = entry
+        try:
+            channel = _ChannelConfig.model_validate(candidate)
+        except ValidationError:
+            LOGGER.warning("deep_research_search_channel_invalid", entry=repr(entry))
+            continue
+        if channel.name in BASE_CHANNEL_DESCRIPTIONS or channel.name in seen_names:
+            LOGGER.warning("deep_research_search_channel_name_conflict", channel=channel.name)
+            continue
+        seen_names.add(channel.name)
+        channels.append(channel)
     return channels
+
+
+@dataclass(frozen=True)
+class _ResolvedChannel:
+    """One search channel bound to its resolved toolkit for a single run."""
+
+    toolkit: Toolkit
+    function: str
+    description: str
+    arguments: dict[str, object] | None
 
 
 DEFAULT_MAX_ROUNDS = MAX_ROUNDS_CAP
@@ -182,7 +220,7 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[:max_chars].rstrip()
 
 
-def _resolve_model_name(context: object, model: str | None) -> str:
+def _resolve_model_name(context: ToolRuntimeContext, model: str | None) -> str:
     if model:
         if model not in context.config.models:
             available = ", ".join(sorted(context.config.models))
@@ -200,13 +238,9 @@ def _resolve_model_name(context: object, model: str | None) -> str:
     return resolved.model_name
 
 
-def _session_id(context: object, role: str, count: int) -> str:
+def _session_id(context: ToolRuntimeContext, role: str, count: int) -> str:
     base = context.session_id or context.correlation_id or context.resolved_thread_id or context.room_id
     return f"deep-research:{base}:{role}:{count}"
-
-
-def _content_from_response(response: object) -> object:
-    return getattr(response, "content", response)
 
 
 def _extract_text_from_website_payload(payload: str) -> tuple[str, str]:
@@ -239,13 +273,46 @@ def _extract_text_from_website_payload(payload: str) -> tuple[str, str]:
     return title, "\n\n".join(chunks)
 
 
-def _first_string(row: dict[str, object], keys: tuple[str, ...]) -> str:
-    """Return the first non-empty string value among keys, skipping non-string values."""
-    for key in keys:
-        value = row.get(key)
-        if isinstance(value, str) and value.strip():
-            return value
-    return ""
+_URL_KEYS = ("link", "url", "uri", "permalink")
+_TITLE_KEYS = ("title", "name")
+_SNIPPET_KEYS = ("snippet", "description", "summary", "context", "text", "domain")
+
+
+class _SearchResultRow(BaseModel):
+    """One search row normalized from any supported backend shape.
+
+    Backends use different key names; each field takes the first key in its
+    priority tuple that carries a non-empty string, skipping non-string
+    values (some APIs put metadata objects under keys like "link").
+    """
+
+    url: str
+    title: str = ""
+    snippet: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _from_backend_row(cls, data: object) -> dict[str, str]:
+        if not isinstance(data, dict):
+            msg = "search row must be a JSON object"
+            raise ValueError(msg)
+
+        def first_string(keys: tuple[str, ...]) -> str:
+            for key in keys:
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+            return ""
+
+        url = first_string(_URL_KEYS)
+        if not url:
+            msg = "search row carries no URL"
+            raise ValueError(msg)
+        return {
+            "url": url,
+            "title": first_string(_TITLE_KEYS),
+            "snippet": first_string(_SNIPPET_KEYS)[:HIT_SNIPPET_CHAR_LIMIT],
+        }
 
 
 def _parse_search_results(raw: str) -> list[SearchHit]:
@@ -269,36 +336,28 @@ def _parse_search_results(raw: str) -> list[SearchHit]:
         return []
     hits: list[SearchHit] = []
     for row in rows:
-        if not isinstance(row, dict):
+        try:
+            normalized = _SearchResultRow.model_validate(row)
+        except ValidationError:
             continue
-        url = _first_string(row, ("link", "url", "uri", "permalink"))
-        if not url:
-            continue
-        title = _first_string(row, ("title", "name")) or url
-        snippet = _first_string(row, ("snippet", "description", "summary", "context", "text", "domain"))
-        hits.append(SearchHit(url=url, title=title, snippet=snippet[:HIT_SNIPPET_CHAR_LIMIT]))
+        hits.append(
+            SearchHit(url=normalized.url, title=normalized.title or normalized.url, snippet=normalized.snippet),
+        )
     return hits
 
 
-def _tool_function_entrypoint(toolkit: object, function_name: str) -> Callable[..., object]:
+def _tool_function_entrypoint(toolkit: Toolkit, function_name: str) -> Callable[..., object]:
     # MCP-backed toolkits register their functions in async_functions.
-    for functions_attr in ("functions", "async_functions"):
-        functions = getattr(toolkit, functions_attr, {})
-        if isinstance(functions, dict):
-            function = functions.get(function_name)
-            entrypoint = getattr(function, "entrypoint", None)
-            if callable(entrypoint):
-                return entrypoint
-    fallback = getattr(toolkit, function_name, None)
-    if callable(fallback):
-        return fallback
-    msg = f"Tool function is unavailable: {function_name}"
-    raise RuntimeError(msg)
+    function = toolkit.functions.get(function_name) or toolkit.async_functions.get(function_name)
+    if function is None or function.entrypoint is None:
+        msg = f"Tool function is unavailable: {function_name}"
+        raise RuntimeError(msg)
+    return function.entrypoint
 
 
-async def _call_tool_function(toolkit: object, function_name: str, *args: object, **kwargs: object) -> str:
+async def _call_tool_function(toolkit: Toolkit, function_name: str, *args: object, **kwargs: object) -> str:
     raw = await asyncio.to_thread(_tool_function_entrypoint(toolkit, function_name), *args, **kwargs)
-    return raw if isinstance(raw, str) else str(raw)
+    return _result_text(raw)
 
 
 def _accepts_keyword(function: Callable[..., object], name: str) -> bool:
@@ -366,91 +425,27 @@ async def _call_search_function(
 def _result_text(raw: object) -> str:
     """Normalize a search call's return value to text.
 
-    MCP-style result objects carry their text in .content — either a string
-    or a list of content blocks. The unwrap is deliberately conservative:
-    anything that does not yield usable text falls back to the previous
-    stringification, so plain results and unrelated .content attributes
-    keep their old behavior.
+    Search callables return plain text; MindRoom's MCP toolkits return an
+    agno ToolResult whose content is already normalized to a string.
+    Anything else is a contract violation and fails loudly.
     """
     if isinstance(raw, str):
         return raw
-    content = getattr(raw, "content", None)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        texts: list[str] = []
-        for block in content:
-            text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
-            if isinstance(text, str) and text.strip():
-                texts.append(text)
-        if texts:
-            return "\n".join(texts)
-    return str(raw)
+    if isinstance(raw, ToolResult):
+        return raw.content
+    msg = f"Search function returned an unsupported result type: {type(raw).__name__}"
+    raise TypeError(msg)
 
 
-def _tool_entry_field(entry: object, field: str) -> object:
-    if isinstance(entry, dict):
-        return entry.get(field)
-    return getattr(entry, field, None)
-
-
-def _caller_worker_target(context: object) -> object | None:
-    """Resolve the calling agent's worker target for channel tool construction.
-
-    OAuth-backed MCP servers key their sessions by the requester's worker
-    scope and key; a toolkit built without a worker target lands on the
-    unscoped session, where no user connection exists, and every call
-    returns a sign-in payload even for connected requesters. Mirrors the
-    inputs the agent's own toolkit build uses; returns None (previous
-    behavior) if anything about the runtime shape is unexpected.
-    """
-    try:
-        config = context.config
-        agent_name = context.agent_name
-        scope_resolver = getattr(config, "_agent_execution_scope", None)
-        worker_scope = scope_resolver(agent_name) if callable(scope_resolver) else None
-        agent_config = (getattr(config, "agents", None) or {}).get(agent_name)
-        is_private = getattr(agent_config, "private", None) is not None
-        if worker_scope == "user_agent":
-            private_agent_names = frozenset({agent_name}) if is_private else frozenset()
-        else:
-            private_agent_names = None
-        return build_worker_target_from_runtime_env(
-            worker_scope,
-            agent_name,
-            execution_identity=build_execution_identity_from_runtime_context(context),
-            runtime_paths=context.runtime_paths,
-            private_agent_names=private_agent_names,
-        )
-    except Exception as exc:
-        LOGGER.warning("deep_research_worker_target_resolution_failed", error=str(exc))
-        return None
-
-
-def _worker_shared_services(context: object, worker_target: object | None) -> frozenset[str] | None:
-    """Fail-soft like _caller_worker_target: None means the previous unscoped behavior."""
-    try:
-        if worker_target is None or getattr(worker_target, "worker_scope", None) is None:
-            return None
-        grantable = getattr(context.config, "get_worker_grantable_credentials", None)
-        return grantable() if callable(grantable) else None
-    except Exception as exc:
-        LOGGER.warning("deep_research_shared_services_resolution_failed", error=str(exc))
-        return None
-
-
-def _authored_tool_overrides(context: object, tool_name: str) -> dict[str, object]:
+def _authored_tool_overrides(context: ToolRuntimeContext, tool_name: str) -> dict[str, object]:
     """Return the calling agent's authored config overrides for one tool."""
-    agents = getattr(getattr(context, "config", None), "agents", None)
-    agent = agents.get(getattr(context, "agent_name", None)) if isinstance(agents, dict) else None
-    for entry in getattr(agent, "tools", None) or []:
-        if _tool_entry_field(entry, "name") == tool_name:
-            overrides = _tool_entry_field(entry, "overrides")
-            return dict(overrides) if isinstance(overrides, dict) else {}
+    for entry in context.config.get_agent(context.agent_name).tools:
+        if entry.name == tool_name:
+            return dict(entry.overrides)
     return {}
 
 
-async def _emit_message(context: object, text: str, *, timeout_seconds: float = PROGRESS_EMIT_TIMEOUT_SECONDS) -> None:
+async def _emit_message(context: ToolRuntimeContext, text: str, *, timeout_seconds: float = PROGRESS_EMIT_TIMEOUT_SECONDS) -> None:
     bindings = resolve_tool_runtime_hook_bindings(context)
     if bindings.message_sender is None:
         return
@@ -634,7 +629,7 @@ class DeepResearchTools(Toolkit):
                 f"Search tool '{search_tool_name}' is not configured or unavailable. "
                 "Configure it to use deep_research.",
             )
-        if hasattr(search_toolkit, "api_key") and not getattr(search_toolkit, "api_key", None):
+        if isinstance(search_toolkit, SerperTools) and not search_toolkit.api_key:
             return _error(
                 f"Search tool '{search_tool_name}' is not configured. "
                 "Configure its API key to use deep_research.",
@@ -643,45 +638,48 @@ class DeepResearchTools(Toolkit):
         # Extra search channels degrade gracefully: an unavailable channel is
         # dropped (and reported in warnings) instead of failing the run, and
         # the reasoner is only told about channels that actually resolved.
-        channels: dict[str, dict[str, object]] = {}
+        channels: dict[str, _ResolvedChannel] = {}
         channel_warnings: list[str] = []
-        channel_worker_target = _caller_worker_target(context) if self.search_channels else None
-        channel_shared_services = _worker_shared_services(context, channel_worker_target)
+        channel_worker_target: ResolvedWorkerTarget | None = None
+        channel_shared_services: frozenset[str] | None = None
+        if self.search_channels:
+            # Requires MindRoom >= v2026.7.38 (ToolRuntimeContext.resolve_worker_target);
+            # older runtimes fail loudly here rather than degrading to an
+            # unscoped session that can never be signed in.
+            channel_worker_target = context.resolve_worker_target()
+            if channel_worker_target.worker_scope is not None:
+                channel_shared_services = context.config.get_worker_grantable_credentials()
         for channel_config in self.search_channels:
-            channel_name = str(channel_config["name"])
-            channel_tool = str(channel_config["tool"])
-            channel_function = str(channel_config["function"])
             try:
                 channel_toolkit = get_tool_by_name(
-                    channel_tool,
+                    channel_config.tool,
                     context.runtime_paths,
-                    tool_config_overrides=_authored_tool_overrides(context, channel_tool) or None,
+                    tool_config_overrides=_authored_tool_overrides(context, channel_config.tool) or None,
                     allowed_shared_services=channel_shared_services,
                     worker_target=channel_worker_target,
                 )
-                _tool_function_entrypoint(channel_toolkit, channel_function)
+                _tool_function_entrypoint(channel_toolkit, channel_config.function)
             except Exception as exc:
                 LOGGER.warning(
                     "deep_research_search_channel_unavailable",
-                    channel=channel_name,
-                    tool=channel_tool,
+                    channel=channel_config.name,
+                    tool=channel_config.tool,
                     error=str(exc),
                 )
-                channel_warnings.append(f"search channel '{channel_name}' unavailable: {exc}")
+                channel_warnings.append(f"search channel '{channel_config.name}' unavailable: {exc}")
                 continue
-            channel_arguments = channel_config.get("arguments")
-            channels[channel_name] = {
-                "toolkit": channel_toolkit,
-                "function": channel_function,
-                "description": str(channel_config["description"]),
-                "arguments": channel_arguments if isinstance(channel_arguments, dict) else None,
-            }
+            channels[channel_config.name] = _ResolvedChannel(
+                toolkit=channel_toolkit,
+                function=channel_config.function,
+                description=channel_config.description,
+                arguments=channel_config.arguments,
+            )
 
         if self.search_function:
             prompt_channels = [("web", BASE_CHANNEL_DESCRIPTIONS["web"])]
         else:
             prompt_channels = [(name, BASE_CHANNEL_DESCRIPTIONS[name]) for name in ("web", "news", "scholar")]
-        prompt_channels.extend((name, str(channel["description"])) for name, channel in channels.items())
+        prompt_channels.extend((name, channel.description) for name, channel in channels.items())
 
         try:
             website = get_tool_by_name(
@@ -708,7 +706,7 @@ class DeepResearchTools(Toolkit):
                 markdown=False,
             )
             response = await agent.arun(prompt, session_id=_session_id(context, "reason", counters["reason"]))
-            return _content_from_response(response)
+            return response.content
 
         async def extract_fn(prompt: str) -> object:
             counters["extract"] += 1
@@ -719,13 +717,13 @@ class DeepResearchTools(Toolkit):
                 markdown=False,
             )
             response = await agent.arun(prompt, session_id=_session_id(context, "extract", counters["extract"]))
-            return _content_from_response(response)
+            return response.content
 
         async def synthesize_fn(prompt: str) -> str:
             counters["synthesize"] += 1
             agent = Agent(model=live_model, telemetry=False, markdown=False)
             response = await agent.arun(prompt, session_id=_session_id(context, "synthesize", counters["synthesize"]))
-            content = _content_from_response(response)
+            content = response.content
             return content if isinstance(content, str) else str(content)
 
         async def ground_fn(prompt: str) -> object:
@@ -737,18 +735,17 @@ class DeepResearchTools(Toolkit):
                 markdown=False,
             )
             response = await agent.arun(prompt, session_id=_session_id(context, "ground", counters["ground"]))
-            return _content_from_response(response)
+            return response.content
 
         async def search_fn(query: SearchQuery, limit: int) -> list[SearchHit]:
             channel = channels.get(query.kind)
             if channel is not None:
-                channel_arguments = channel["arguments"]
                 raw = await _call_search_function(
-                    channel["toolkit"],
-                    str(channel["function"]),
+                    channel.toolkit,
+                    channel.function,
                     query.query,
                     num_results=limit,
-                    arguments=channel_arguments if isinstance(channel_arguments, dict) else None,
+                    arguments=channel.arguments,
                 )
             else:
                 search_method = (

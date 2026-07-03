@@ -180,6 +180,10 @@ agents:
 
   Plain YAML mappings remain supported wherever config reaches the tool unconverted (global tool config, direct construction).
 
+## Requirements
+
+MindRoom **v2026.7.38 or newer**: the plugin resolves search-channel toolkits through the typed `ToolRuntimeContext.resolve_worker_target()` API so OAuth-backed MCP channels use the requester's own connection. There is deliberately no fallback for older runtimes — channel resolution fails with a clear error instead of degrading to an unscoped session that can never be signed in.
+
 ## Setup
 
 1. Copy this plugin to `~/.mindroom/plugins/deep-research`.
