@@ -18,6 +18,8 @@ from uuid import uuid4
 
 import pytest
 
+from agno.tools.function import ToolResult
+
 from mindroom.config.main import Config, load_config
 from mindroom.constants import resolve_primary_runtime_paths
 from mindroom.tool_system.metadata import SetupType, TOOL_METADATA, ToolStatus, get_tool_by_name as resolve_tool_by_name
@@ -55,10 +57,15 @@ def _tool_context(
     resolve_runtime_model: Mock | None = None,
 ) -> ToolRuntimeContext:
     resolver = resolve_runtime_model or Mock(return_value=SimpleNamespace(model_name="resolved"))
+    agent = SimpleNamespace(tools=[], private=None)
     config = SimpleNamespace(
         models={"active": object(), "override": object(), "resolved": object()},
         resolve_runtime_model=resolver,
         debug=SimpleNamespace(log_llm_requests=False),
+        agents={"code": agent},
+        get_agent=lambda _name, _agent=agent: _agent,
+        agent_execution_scope=lambda _name: None,
+        get_worker_grantable_credentials=lambda: frozenset(),
     )
     return ToolRuntimeContext(
         agent_name="code",
@@ -68,7 +75,7 @@ def _tool_context(
         requester_id="@user:localhost",
         client=AsyncMock(),
         config=config,
-        runtime_paths=SimpleNamespace(),
+        runtime_paths=SimpleNamespace(env_value=lambda _name: None),
         event_cache=AsyncMock(),
         conversation_cache=AsyncMock(),
         active_model_name=active_model_name,
@@ -78,8 +85,17 @@ def _tool_context(
     )
 
 
+def _register_functions(toolkit: Any, *names: str) -> Any:
+    toolkit.functions = {name: SimpleNamespace(entrypoint=getattr(toolkit, name)) for name in names}
+    toolkit.async_functions = {}
+    return toolkit
+
+
 class _FakeSerper:
     api_key = "key"
+
+    def __init__(self) -> None:
+        _register_functions(self, "search_web", "search_news", "search_scholar", "scrape_webpage")
 
     def search_web(self, _query: str, num_results: int | None = None) -> str:
         return json.dumps({"organic": []})
@@ -95,6 +111,9 @@ class _FakeSerper:
 
 
 class _FakeWebsite:
+    def __init__(self) -> None:
+        _register_functions(self, "read_url")
+
     def read_url(self, _url: str) -> str:
         return json.dumps([{"content": "website text long enough" * 40, "meta_data": {"title": "Title"}}])
 
@@ -547,6 +566,9 @@ async def test_depth_args_are_forwarded_to_loop_and_page_reader() -> None:
         return _result(module)
 
     class LongWebsite:
+        def __init__(self) -> None:
+            _register_functions(self, "read_url")
+
         def read_url(self, _url: str) -> str:
             return json.dumps([{"content": "x" * 200_000, "meta_data": {"title": "Long"}}])
 
@@ -734,6 +756,9 @@ async def test_website_error_payload_returns_read_warning() -> None:
     tools = module.DeepResearchTools()
 
     class ErrorWebsite:
+        def __init__(self) -> None:
+            _register_functions(self, "read_url")
+
         def read_url(self, _url: str) -> str:
             return json.dumps({"status": "error", "message": "fetch failed"})
 
@@ -802,6 +827,9 @@ async def test_read_boundary_uses_native_website_hardening_without_serper_fallba
             return scrape_webpage(scrape_url)
 
     class HardenedWebsite:
+        def __init__(self) -> None:
+            _register_functions(self, "read_url")
+
         def read_url(self, read_url: str) -> str:
             assert read_url == url
             raise RuntimeError(f"blocked by native website hardening: {reason}")
@@ -832,15 +860,14 @@ async def test_read_boundary_uses_native_website_hardening_without_serper_fallba
 
 
 @pytest.mark.asyncio
-async def test_serper_unconfigured_returns_clear_error() -> None:
+async def test_serper_unconfigured_returns_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _load_tools_module()
     tools = module.DeepResearchTools()
-
-    class NoKeySerper(_FakeSerper):
-        api_key = None
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+    from agno.tools.serper import SerperTools
 
     def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
-        return NoKeySerper() if name == "serper" else _FakeWebsite()
+        return SerperTools(api_key=None) if name == "serper" else _FakeWebsite()
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
@@ -872,6 +899,9 @@ async def test_custom_search_backend_serves_all_query_kinds() -> None:
     queries: list[str] = []
 
     class GroundedSearch:
+        def __init__(self) -> None:
+            _register_functions(self, "search_public_web")
+
         def search_public_web(self, query: str) -> str:
             queries.append(query)
             return json.dumps(
@@ -917,6 +947,9 @@ async def test_custom_async_search_function_is_awaited() -> None:
     tools = module.DeepResearchTools(search_tool="grounded_search", search_function="search_public_web")
 
     class AsyncGroundedSearch:
+        def __init__(self) -> None:
+            _register_functions(self, "search_public_web")
+
         async def search_public_web(self, query: str) -> str:
             return json.dumps({"sources": [{"uri": "https://example.com/async", "title": query}]})
 
@@ -950,14 +983,15 @@ async def test_search_tool_resolution_uses_calling_agents_authored_overrides() -
     module = _load_tools_module()
     tools = module.DeepResearchTools(search_tool="grounded_search", search_function="search_public_web")
     context = _tool_context(sender=AsyncMock())
-    context.config.agents = {
-        "code": SimpleNamespace(
-            tools=[SimpleNamespace(name="grounded_search", overrides={"project_id": "demo-project"})],
-        ),
-    }
+    context.config.agents["code"].tools = [
+        SimpleNamespace(name="grounded_search", overrides={"project_id": "demo-project"}),
+    ]
     calls: list[tuple[str, Any]] = []
 
     class GroundedSearch:
+        def __init__(self) -> None:
+            _register_functions(self, "search_public_web")
+
         def search_public_web(self, _query: str) -> str:
             return json.dumps({"sources": []})
 
@@ -982,16 +1016,17 @@ async def test_search_tool_resolution_uses_calling_agents_authored_overrides() -
     assert ("grounded_search", {"project_id": "demo-project"}) in calls
 
 
-def test_authored_tool_overrides_accepts_object_and_dict_entries() -> None:
+def test_authored_tool_overrides_reads_typed_agent_entries() -> None:
     module = _load_tools_module()
-    entries = [
-        SimpleNamespace(name="object_search", overrides={"project_id": "object-project"}),
-        {"name": "dict_search", "overrides": {"project_id": "dict-project"}},
-    ]
-    context = SimpleNamespace(agent_name="code", config=SimpleNamespace(agents={"code": SimpleNamespace(tools=entries)}))
+    agent = SimpleNamespace(
+        tools=[
+            SimpleNamespace(name="object_search", overrides={"project_id": "object-project"}),
+            SimpleNamespace(name="other_tool", overrides={}),
+        ],
+    )
+    context = SimpleNamespace(agent_name="code", config=SimpleNamespace(get_agent=lambda _name: agent))
 
     assert module._authored_tool_overrides(context, "object_search") == {"project_id": "object-project"}
-    assert module._authored_tool_overrides(context, "dict_search") == {"project_id": "dict-project"}
     assert module._authored_tool_overrides(context, "unlisted_search") == {}
 
 
@@ -1057,7 +1092,7 @@ def test_parse_search_channels_accepts_dicts_and_compact_strings() -> None:
         ],
     )
 
-    assert channels == [
+    assert [channel.model_dump() for channel in channels] == [
         {
             "name": "wiki",
             "tool": "wiki_tool",
@@ -1107,11 +1142,17 @@ async def test_search_channels_route_by_kind_and_advertise_to_reasoner() -> None
     web_queries: list[str] = []
 
     class GroundedSearch:
+        def __init__(self) -> None:
+            _register_functions(self, "search_public_web")
+
         def search_public_web(self, query: str) -> str:
             web_queries.append(query)
             return json.dumps({"sources": [{"uri": "https://web.example/a", "title": "W"}]})
 
     class WikiTool:
+        def __init__(self) -> None:
+            _register_functions(self, "search_documents")
+
         def search_documents(self, query: str) -> str:
             channel_queries.append(query)
             return json.dumps([{"url": "https://wiki.example/doc/1", "title": "Doc", "context": "wiki fact"}])
@@ -1162,6 +1203,9 @@ async def test_unavailable_search_channel_degrades_with_warning() -> None:
     )
 
     class GroundedSearch:
+        def __init__(self) -> None:
+            _register_functions(self, "search_public_web")
+
         def search_public_web(self, _query: str) -> str:
             return json.dumps({"sources": []})
 
@@ -1200,18 +1244,22 @@ async def test_search_channel_tools_resolve_with_agent_authored_overrides() -> N
         search_channels=[{"name": "wiki", "tool": "wiki_tool", "function": "search_documents"}],
     )
     context = _tool_context(sender=AsyncMock())
-    context.config.agents = {
-        "code": SimpleNamespace(
-            tools=[SimpleNamespace(name="wiki_tool", overrides={"collection": "engineering"})],
-        ),
-    }
+    context.config.agents["code"].tools = [
+        SimpleNamespace(name="wiki_tool", overrides={"collection": "engineering"}),
+    ]
     calls: list[tuple[str, Any]] = []
 
     class GroundedSearch:
+        def __init__(self) -> None:
+            _register_functions(self, "search_public_web")
+
         def search_public_web(self, _query: str) -> str:
             return json.dumps({"sources": []})
 
     class WikiTool:
+        def __init__(self) -> None:
+            _register_functions(self, "search_documents")
+
         def search_documents(self, _query: str) -> str:
             return json.dumps([])
 
@@ -1287,7 +1335,7 @@ def test_substitute_placeholders_preserves_types_and_nests() -> None:
     }
 
 
-def test_parse_search_channels_keeps_dict_arguments_only() -> None:
+def test_parse_search_channels_rejects_non_dict_arguments() -> None:
     module = _load_tools_module()
 
     channels = module._parse_search_channels(
@@ -1302,8 +1350,10 @@ def test_parse_search_channels_keeps_dict_arguments_only() -> None:
         ],
     )
 
-    assert channels[0]["arguments"] == {"tool_name": "search_documents", "arguments": {"query": "{query}"}}
-    assert channels[1]["arguments"] is None
+    # Typed validation: an entry with a non-dict arguments template is
+    # invalid and dropped, not silently nulled.
+    assert [channel.name for channel in channels] == ["wiki"]
+    assert channels[0].arguments == {"tool_name": "search_documents", "arguments": {"query": "{query}"}}
 
 
 @pytest.mark.asyncio
@@ -1327,24 +1377,24 @@ async def test_mcp_bridge_channel_uses_arguments_template_async_functions_and_co
     )
     bridge_calls: list[dict[str, Any]] = []
 
-    class FakeToolResult:
-        def __init__(self, content: str) -> None:
-            self.content = content
-
     class McpWiki:
         def __init__(self) -> None:
-            async def bridge(*, tool_name: str, arguments: dict[str, Any]) -> FakeToolResult:
+            async def bridge(*, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
                 bridge_calls.append({"tool_name": tool_name, "arguments": arguments})
-                return FakeToolResult(
-                    json.dumps(
+                return ToolResult(
+                    content=json.dumps(
                         {"documents": [{"url": "https://wiki.example/doc/1", "title": "Doc", "context": "wiki fact"}]},
                     ),
                 )
 
             # MCP toolkits register functions in async_functions, not functions.
+            self.functions: dict[str, Any] = {}
             self.async_functions = {"wiki_call_tool": _entrypoint(bridge)}
 
     class GroundedSearch:
+        def __init__(self) -> None:
+            _register_functions(self, "search_public_web")
+
         def search_public_web(self, _query: str) -> str:
             return json.dumps({"sources": []})
 
@@ -1390,25 +1440,13 @@ def test_substitute_placeholders_does_not_reexpand_placeholder_text_in_query() -
     assert substituted == {"note": "q=find {num_results} docs limit=5"}
 
 
-def test_result_text_unwraps_string_and_block_list_content_conservatively() -> None:
+def test_result_text_accepts_str_and_tool_result_and_rejects_everything_else() -> None:
     module = _load_tools_module()
 
-    class StrContent:
-        content = '{"results": []}'
-
-    class BlockContent:
-        content = [SimpleNamespace(text='{"documents": []}'), {"text": "second block"}, {"no_text": True}]
-
-    class UnrelatedContent:
-        content = 42
-
-        def __str__(self) -> str:
-            return "plain repr"
-
     assert module._result_text("already text") == "already text"
-    assert module._result_text(StrContent()) == '{"results": []}'
-    assert module._result_text(BlockContent()) == '{"documents": []}\nsecond block'
-    assert module._result_text(UnrelatedContent()) == "plain repr"
+    assert module._result_text(ToolResult(content='{"results": []}')) == '{"results": []}'
+    with pytest.raises(TypeError, match="unsupported result type"):
+        module._result_text(42)
 
 
 def test_parse_search_channels_accepts_json_object_strings() -> None:
@@ -1422,17 +1460,17 @@ def test_parse_search_channels_accepts_json_object_strings() -> None:
         ],
     )
 
-    assert [channel["name"] for channel in channels] == ["wiki", "chat"]
-    assert channels[0]["tool"] == "mcp_wiki"
-    assert channels[0]["function"] == "wiki_call_tool"
-    assert channels[0]["description"] == "Internal wiki"
-    assert channels[0]["arguments"] == {
+    assert [channel.name for channel in channels] == ["wiki", "chat"]
+    assert channels[0].tool == "mcp_wiki"
+    assert channels[0].function == "wiki_call_tool"
+    assert channels[0].description == "Internal wiki"
+    assert channels[0].arguments == {
         "tool_name": "list_documents",
         "arguments": {"query": "{query}", "limit": "{num_results}"},
     }
-    assert channels[1]["tool"] == "chat_tool"
-    assert channels[1]["function"] == "search_messages"
-    assert channels[1]["arguments"] is None
+    assert channels[1].tool == "chat_tool"
+    assert channels[1].function == "search_messages"
+    assert channels[1].arguments is None
 
 
 def test_parse_search_channels_reparses_comma_joined_runtime_string() -> None:
@@ -1450,8 +1488,8 @@ def test_parse_search_channels_reparses_comma_joined_runtime_string() -> None:
 
     channels = module._parse_search_channels(joined)
 
-    assert [channel["name"] for channel in channels] == ["wiki", "chat"]
-    assert channels[0]["description"] == "Runbooks, docs, and more"
+    assert [channel.name for channel in channels] == ["wiki", "chat"]
+    assert channels[0].description == "Runbooks, docs, and more"
 
 
 def test_parse_search_channels_drops_malformed_json_strings_without_crashing() -> None:
@@ -1459,7 +1497,7 @@ def test_parse_search_channels_drops_malformed_json_strings_without_crashing() -
 
     channels = module._parse_search_channels(['{"name": "broken"', "chat=chat_tool.search|Chat"])
 
-    assert [channel["name"] for channel in channels] == ["chat"]
+    assert [channel.name for channel in channels] == ["chat"]
 
 
 def test_parse_search_channels_splits_comma_joined_compact_strings() -> None:
@@ -1469,9 +1507,9 @@ def test_parse_search_channels_splits_comma_joined_compact_strings() -> None:
 
     channels = module._parse_search_channels(joined)
 
-    assert [channel["name"] for channel in channels] == ["wiki", "chat"]
-    assert channels[0]["description"] == "Runbooks, docs, and more"
-    assert channels[1]["description"] == "Team chat"
+    assert [channel.name for channel in channels] == ["wiki", "chat"]
+    assert channels[0].description == "Runbooks, docs, and more"
+    assert channels[1].description == "Team chat"
 
 
 def test_parse_search_channels_drops_standalone_malformed_json_string() -> None:
@@ -1551,13 +1589,14 @@ async def test_channel_toolkits_resolve_with_callers_worker_target() -> None:
         search_channels=[{"name": "wiki", "tool": "mcp_wiki", "function": "wiki_call_tool"}],
     )
     context = _tool_context(sender=AsyncMock())
-    context.config._agent_execution_scope = lambda _agent: "user_agent"
-    context.config.agents = {"code": SimpleNamespace(tools=[], private=SimpleNamespace(per="user_agent"))}
+    sentinel_target = SimpleNamespace(worker_scope="user_agent", worker_key="user_agent:bas:code")
     context.config.get_worker_grantable_credentials = lambda: frozenset({"google_vertex_adc"})
-    sentinel_target = SimpleNamespace(worker_scope="user_agent", worker_key="user:code:bas")
     calls: list[tuple[str, Any, Any]] = []
 
     class GroundedSearch:
+        def __init__(self) -> None:
+            _register_functions(self, "search_public_web")
+
         def search_public_web(self, _query: str) -> str:
             return json.dumps({"sources": []})
 
@@ -1567,6 +1606,7 @@ async def test_channel_toolkits_resolve_with_callers_worker_target() -> None:
                 del tool_name, arguments
                 return json.dumps({"documents": []})
 
+            self.functions: dict[str, Any] = {}
             self.async_functions = {"wiki_call_tool": _entrypoint(bridge)}
 
     def tool_by_name(name: str, *_args: Any, **kwargs: Any) -> Any:
@@ -1581,8 +1621,8 @@ async def test_channel_toolkits_resolve_with_callers_worker_target() -> None:
 
     with (
         tool_runtime_context(context),
+        patch.object(type(context), "resolve_worker_target", lambda _self: sentinel_target),
         patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
-        patch.object(module, "build_worker_target_from_runtime_env", return_value=sentinel_target) as build_target,
         patch.object(module, "get_model_instance", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
@@ -1591,52 +1631,48 @@ async def test_channel_toolkits_resolve_with_callers_worker_target() -> None:
 
     assert result["status"] == "ok"
     # The MCP channel is built with the caller's worker target and grantable
-    # shared services, mirroring the agent's own toolkit build; the main
-    # search backend and website reader keep their previous unscoped build.
+    # shared services; the main search backend and website reader keep their
+    # previous unscoped build.
     assert ("mcp_wiki", sentinel_target, frozenset({"google_vertex_adc"})) in calls
     assert ("grounded_search", None, None) in calls
     assert ("website", None, None) in calls
-    assert build_target.call_args.args[0] == "user_agent"
-    assert build_target.call_args.kwargs["private_agent_names"] == frozenset({"code"})
 
 
 @pytest.mark.asyncio
-async def test_worker_target_resolution_failure_degrades_to_unscoped_channels() -> None:
+async def test_worker_target_resolution_failure_is_loud() -> None:
     module = _load_tools_module()
     tools = module.DeepResearchTools(
         search_tool="grounded_search",
         search_function="search_public_web",
         search_channels=[{"name": "wiki", "tool": "wiki_tool", "function": "search_documents"}],
     )
-    calls: list[tuple[str, Any]] = []
+    context = _tool_context(sender=AsyncMock())
+
+    def explode(_self: Any) -> Any:
+        msg = "runtime too old for resolve_worker_target"
+        raise RuntimeError(msg)
 
     class GroundedSearch:
+        def __init__(self) -> None:
+            _register_functions(self, "search_public_web")
+
         def search_public_web(self, _query: str) -> str:
             return json.dumps({"sources": []})
 
-    class WikiTool:
-        def search_documents(self, _query: str) -> str:
-            return json.dumps([])
-
-    def tool_by_name(name: str, *_args: Any, **kwargs: Any) -> Any:
-        calls.append((name, kwargs.get("worker_target")))
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
         if name == "grounded_search":
             return GroundedSearch()
-        if name == "wiki_tool":
-            return WikiTool()
         if name == "website":
             return _FakeWebsite()
         raise AssertionError(name)
 
     with (
-        tool_runtime_context(_tool_context(sender=AsyncMock())),
-        # Identity building blows up: the helper must degrade to None, not fail the run.
-        patch.object(module, "build_execution_identity_from_runtime_context", side_effect=[object(), RuntimeError("no identity")]),
+        tool_runtime_context(context),
+        patch.object(type(context), "resolve_worker_target", explode),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "get_model_instance", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
+        pytest.raises(RuntimeError, match="runtime too old"),
     ):
-        result = json.loads(await tools.deep_research("What?"))
-
-    assert result["status"] == "ok"
-    assert ("wiki_tool", None) in calls
+        await tools.deep_research("What?")
