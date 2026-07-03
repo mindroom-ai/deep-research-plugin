@@ -28,6 +28,7 @@ from mindroom.tool_system.runtime_context import (
     get_tool_runtime_context,
     resolve_tool_runtime_hook_bindings,
 )
+from mindroom.tool_system.worker_routing import build_worker_target_from_runtime_env
 
 from .prompts import BASE_CHANNEL_DESCRIPTIONS
 from .loop import (
@@ -393,6 +394,51 @@ def _tool_entry_field(entry: object, field: str) -> object:
     return getattr(entry, field, None)
 
 
+def _caller_worker_target(context: object) -> object | None:
+    """Resolve the calling agent's worker target for channel tool construction.
+
+    OAuth-backed MCP servers key their sessions by the requester's worker
+    scope and key; a toolkit built without a worker target lands on the
+    unscoped session, where no user connection exists, and every call
+    returns a sign-in payload even for connected requesters. Mirrors the
+    inputs the agent's own toolkit build uses; returns None (previous
+    behavior) if anything about the runtime shape is unexpected.
+    """
+    try:
+        config = context.config
+        agent_name = context.agent_name
+        scope_resolver = getattr(config, "_agent_execution_scope", None)
+        worker_scope = scope_resolver(agent_name) if callable(scope_resolver) else None
+        agent_config = (getattr(config, "agents", None) or {}).get(agent_name)
+        is_private = getattr(agent_config, "private", None) is not None
+        if worker_scope == "user_agent":
+            private_agent_names = frozenset({agent_name}) if is_private else frozenset()
+        else:
+            private_agent_names = None
+        return build_worker_target_from_runtime_env(
+            worker_scope,
+            agent_name,
+            execution_identity=build_execution_identity_from_runtime_context(context),
+            runtime_paths=context.runtime_paths,
+            private_agent_names=private_agent_names,
+        )
+    except Exception as exc:
+        LOGGER.warning("deep_research_worker_target_resolution_failed", error=str(exc))
+        return None
+
+
+def _worker_shared_services(context: object, worker_target: object | None) -> frozenset[str] | None:
+    """Fail-soft like _caller_worker_target: None means the previous unscoped behavior."""
+    try:
+        if worker_target is None or getattr(worker_target, "worker_scope", None) is None:
+            return None
+        grantable = getattr(context.config, "get_worker_grantable_credentials", None)
+        return grantable() if callable(grantable) else None
+    except Exception as exc:
+        LOGGER.warning("deep_research_shared_services_resolution_failed", error=str(exc))
+        return None
+
+
 def _authored_tool_overrides(context: object, tool_name: str) -> dict[str, object]:
     """Return the calling agent's authored config overrides for one tool."""
     agents = getattr(getattr(context, "config", None), "agents", None)
@@ -599,6 +645,8 @@ class DeepResearchTools(Toolkit):
         # the reasoner is only told about channels that actually resolved.
         channels: dict[str, dict[str, object]] = {}
         channel_warnings: list[str] = []
+        channel_worker_target = _caller_worker_target(context) if self.search_channels else None
+        channel_shared_services = _worker_shared_services(context, channel_worker_target)
         for channel_config in self.search_channels:
             channel_name = str(channel_config["name"])
             channel_tool = str(channel_config["tool"])
@@ -608,7 +656,8 @@ class DeepResearchTools(Toolkit):
                     channel_tool,
                     context.runtime_paths,
                     tool_config_overrides=_authored_tool_overrides(context, channel_tool) or None,
-                    worker_target=None,
+                    allowed_shared_services=channel_shared_services,
+                    worker_target=channel_worker_target,
                 )
                 _tool_function_entrypoint(channel_toolkit, channel_function)
             except Exception as exc:

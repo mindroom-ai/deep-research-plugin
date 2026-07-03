@@ -148,7 +148,7 @@ agents:
 
 - The reasoner sees each channel's name and description in its planning prompt and picks the fitting channel per query; unknown kinds fall back to the web channel.
 - Channel functions are called like the main search function (`fn(query)`, with `num_results` only when accepted) and must return JSON in one of the shapes above — rows need a URL (or permalink) to enter the source registry.
-- Channel tools are resolved with the calling agent's authored overrides for that tool, like the main search backend.
+- Channel tools are resolved with the calling agent's authored overrides for that tool, like the main search backend, and with the calling agent's worker target — so OAuth-backed MCP channels use the requester's own connection (per-user sessions) instead of an unscoped session that is never signed in.
   An unavailable channel is dropped for the run and reported in the result's `warnings` instead of failing the research.
 - Channel names `web`, `news`, and `scholar` are reserved for the main backend.
 - Functions that take structured keyword arguments instead of a single query string — MCP tools in particular, including the `<prefix>_call_tool` bridge of OAuth-backed MCP servers — can be called through an `arguments` template with `{query}` and `{num_results}` placeholders.
