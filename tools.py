@@ -107,66 +107,6 @@ def _coerce_channel_entries(raw: object) -> list[object]:
     return entries
 
 
-class _ChannelConfig(BaseModel):
-    """One authored search channel: a named tool+function evidence backend."""
-
-    name: str
-    tool: str
-    function: str
-    description: str = ""
-    arguments: dict[str, object] | None = None
-
-    @model_validator(mode="after")
-    def _normalize(self) -> _ChannelConfig:
-        object.__setattr__(self, "name", self.name.strip().lower())
-        object.__setattr__(self, "tool", self.tool.strip())
-        object.__setattr__(self, "function", self.function.strip())
-        description = self.description.strip() or f"search via the {self.tool} tool"
-        object.__setattr__(self, "description", description)
-        if not self.name or not self.tool or not self.function:
-            msg = "channel entries need name, tool, and function"
-            raise ValueError(msg)
-        return self
-
-
-def _coerce_channel_entries(raw: object) -> list[object]:
-    """Expand raw channel config into a list of entry objects.
-
-    MindRoom validates per-agent string[] overrides as lists of strings and
-    hands them to the constructor comma-joined into ONE string, so channels
-    with structured fields (arguments templates) must be authored as JSON
-    object strings. Wrapping the joined form in brackets re-parses it as a
-    JSON array regardless of commas inside quoted values; individual JSON
-    object strings inside lists are decoded the same way.
-    """
-    if isinstance(raw, str):
-        text = raw.strip()
-        if not text:
-            return []
-        if text.startswith("{"):
-            try:
-                # A successful parse of "[...]" is always a list.
-                return json.loads(f"[{text}]")
-            except json.JSONDecodeError:
-                pass
-        # Comma-joined compact entries: split only where the next segment
-        # looks like a compact channel ("name="), so commas inside
-        # descriptions do not split.
-        return re.split(r", (?=[A-Za-z0-9_-]+=)", text)
-    if not isinstance(raw, list):
-        return []
-    entries: list[object] = []
-    for entry in raw:
-        if isinstance(entry, str) and entry.lstrip().startswith("{"):
-            try:
-                entries.append(json.loads(entry))
-                continue
-            except json.JSONDecodeError:
-                pass
-        entries.append(entry)
-    return entries
-
-
 def _parse_search_channels(raw: object) -> list[_ChannelConfig]:
     """Validate authored search_channels config into typed channel configs.
 
@@ -217,7 +157,7 @@ class _ResolvedChannel:
     arguments: dict[str, object] | None
 
 
-DEFAULT_MAX_ROUNDS = MAX_ROUNDS_CAPDEFAULT_MAX_ROUNDS = MAX_ROUNDS_CAP
+DEFAULT_MAX_ROUNDS = MAX_ROUNDS_CAP
 DEFAULT_WALL_CLOCK_SECONDS = WALL_CLOCK_SECONDS_CAP
 DEFAULT_MAX_QUERIES_PER_ROUND = MAX_QUERIES_PER_ROUND
 DEFAULT_RESULTS_PER_QUERY = RESULTS_PER_QUERY
