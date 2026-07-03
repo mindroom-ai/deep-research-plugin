@@ -16,7 +16,7 @@ from agno.agent import Agent
 from agno.tools import Toolkit
 from agno.tools.function import ToolResult
 from agno.tools.serper import SerperTools
-from pydantic import BaseModel, ValidationError, model_validator
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 from mindroom.logging_config import get_logger
 from mindroom.model_loading import get_model_instance
@@ -78,16 +78,27 @@ class _ChannelConfig(BaseModel):
     description: str = ""
     arguments: dict[str, object] | None = None
 
-    @model_validator(mode="after")
-    def _normalize(self) -> _ChannelConfig:
-        object.__setattr__(self, "name", self.name.strip().lower())
-        object.__setattr__(self, "tool", self.tool.strip())
-        object.__setattr__(self, "function", self.function.strip())
-        description = self.description.strip() or f"search via the {self.tool} tool"
-        object.__setattr__(self, "description", description)
-        if not self.name or not self.tool or not self.function:
+    @field_validator("name")
+    @classmethod
+    def _normalize_name(cls, value: str) -> str:
+        name = value.strip().lower()
+        if not name:
+            msg = "channel name must not be empty"
+            raise ValueError(msg)
+        return name
+
+    @field_validator("tool", "function")
+    @classmethod
+    def _require_identifier(cls, value: str) -> str:
+        identifier = value.strip()
+        if not identifier:
             msg = "channel entries need name, tool, and function"
             raise ValueError(msg)
+        return identifier
+
+    @model_validator(mode="after")
+    def _default_description(self) -> _ChannelConfig:
+        self.description = self.description.strip() or f"search via the {self.tool} tool"
         return self
 
 
