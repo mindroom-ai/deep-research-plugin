@@ -182,7 +182,7 @@ agents:
 
 ## Requirements
 
-MindRoom **v2026.7.38 or newer**: the plugin resolves search-channel toolkits through the typed `ToolRuntimeContext.resolve_worker_target()` API so OAuth-backed MCP channels use the requester's own connection. There is deliberately no fallback for older runtimes — channel resolution fails with a clear error instead of degrading to an unscoped session that can never be signed in.
+MindRoom **v2026.7.99 or newer**: the plugin uses the split tool declaration/registration API and resolves search-channel toolkits through the typed `ToolRuntimeContext.resolve_worker_target()` API so OAuth-backed MCP channels use the requester's own connection. There is deliberately no fallback for older runtimes — channel resolution fails with a clear error instead of degrading to an unscoped session that can never be signed in.
 
 ## Setup
 

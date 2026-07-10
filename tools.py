@@ -20,14 +20,14 @@ from pydantic import BaseModel, ValidationError, field_validator, model_validato
 
 from mindroom.logging_config import get_logger
 from mindroom.model_loading import get_model_instance
-from mindroom.tool_system.metadata import (
+from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
     ToolCategory,
     ToolStatus,
-    get_tool_by_name,
-    register_tool_with_metadata,
 )
+from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.tool_system.runtime_context import (
     build_execution_identity_from_runtime_context,
     get_tool_runtime_context,
@@ -643,7 +643,7 @@ class DeepResearchTools(Toolkit):
         channel_worker_target: ResolvedWorkerTarget | None = None
         channel_shared_services: frozenset[str] | None = None
         if self.search_channels:
-            # Requires MindRoom >= v2026.7.38 (ToolRuntimeContext.resolve_worker_target);
+            # Requires MindRoom >= v2026.7.99 (ToolRuntimeContext.resolve_worker_target);
             # older runtimes fail loudly here rather than degrading to an
             # unscoped session that can never be signed in.
             channel_worker_target = context.resolve_worker_target()

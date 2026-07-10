@@ -22,9 +22,15 @@ from agno.tools.function import ToolResult
 
 from mindroom.config.main import Config, load_config
 from mindroom.constants import resolve_primary_runtime_paths
-from mindroom.tool_system.metadata import SetupType, TOOL_METADATA, ToolStatus, get_tool_by_name as resolve_tool_by_name
+from mindroom.message_target import MessageTarget
+from mindroom.tool_system.declarations import SetupType, ToolStatus
+from mindroom.tool_system.metadata import get_tool_by_name as resolve_tool_by_name
 from mindroom.tool_system.plugins import load_plugins
-from mindroom.tool_system.registry_state import capture_tool_registry_snapshot, restore_tool_registry_snapshot
+from mindroom.tool_system.registry_state import (
+    TOOL_METADATA,
+    capture_tool_registry_snapshot,
+    restore_tool_registry_snapshot,
+)
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
 
 if TYPE_CHECKING:
@@ -64,14 +70,18 @@ def _tool_context(
         debug=SimpleNamespace(log_llm_requests=False),
         agents={"code": agent},
         get_agent=lambda _name, _agent=agent: _agent,
-        agent_execution_scope=lambda _name: None,
+        resolve_entity=lambda _name: SimpleNamespace(execution_scope=None),
         get_worker_grantable_credentials=lambda: frozenset(),
     )
     return ToolRuntimeContext(
         agent_name="code",
-        room_id="!room:localhost",
-        thread_id="$thread-root",
-        resolved_thread_id="$thread-root",
+        target=MessageTarget(
+            room_id="!room:localhost",
+            source_thread_id="$thread-root",
+            resolved_thread_id="$thread-root",
+            reply_to_event_id=None,
+            session_id="session-1",
+        ),
         requester_id="@user:localhost",
         client=AsyncMock(),
         config=config,
@@ -79,7 +89,6 @@ def _tool_context(
         event_cache=AsyncMock(),
         conversation_cache=AsyncMock(),
         active_model_name=active_model_name,
-        session_id="session-1",
         hook_message_sender=sender,
         correlation_id="corr-1",
     )
