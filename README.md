@@ -184,6 +184,31 @@ agents:
 
 MindRoom **v2026.7.99 or newer**: the plugin uses the split tool declaration/registration API and resolves search-channel toolkits through the typed `ToolRuntimeContext.resolve_worker_target()` API so OAuth-backed MCP channels use the requester's own connection. There is deliberately no fallback for older runtimes — channel resolution fails with a clear error instead of degrading to an unscoped session that can never be signed in.
 
+## Install
+
+Vendor this plugin with the MindRoom CLI:
+
+```bash
+mindroom plugins install deep-research-plugin
+```
+
+Then reference it from `config.yaml`:
+
+```yaml
+plugins:
+  - path: plugins/deep-research-plugin
+```
+
+Update to the latest commit later with:
+
+```bash
+mindroom plugins update deep-research-plugin
+```
+
+The command pins the exact installed commit in `.mindroom-plugin.lock.json` and strictly validates the plugin before activating it.
+It requires a MindRoom release newer than v2026.7.175.
+For a manual checkout instead, see Setup below.
+
 ## Setup
 
 1. Copy this plugin to `~/.mindroom/plugins/deep-research`.
