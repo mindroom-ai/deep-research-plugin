@@ -9,6 +9,7 @@ import importlib
 import json
 import os
 import sys
+from dataclasses import fields
 from importlib import util
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +38,22 @@ if TYPE_CHECKING:
     from types import ModuleType
 
 PACKAGE_NAME = f"mindroom_plugin_{Path(__file__).resolve().parents[1].name.replace('-', '_')}"
+
+# This plugin reads none of MindRoom's conversation collaborators; it only has
+# to name the required ones to build a context at all. Which ones those are is
+# moving: the event-journal cutover drops `event_cache` for `conversation_reader`
+# and `relations`, and retires the conversation cache after that. Naming every
+# spelling and passing only the ones the installed MindRoom declares keeps this
+# suite green on both sides of that change instead of pinning it to one.
+_CONVERSATION_COLLABORATORS = frozenset(
+    {"conversation_cache", "conversation_reader", "event_cache", "relations"},
+)
+
+
+def _conversation_collaborators() -> dict[str, AsyncMock]:
+    """Return a stand-in for each conversation collaborator this MindRoom declares."""
+    declared = {field.name for field in fields(ToolRuntimeContext)}
+    return {name: AsyncMock() for name in _CONVERSATION_COLLABORATORS & declared}
 
 
 def _load_tools_module() -> ModuleType:
@@ -86,8 +103,7 @@ def _tool_context(
         client=AsyncMock(),
         config=config,
         runtime_paths=SimpleNamespace(env_value=lambda _name: None),
-        event_cache=AsyncMock(),
-        conversation_cache=AsyncMock(),
+        **_conversation_collaborators(),
         active_model_name=active_model_name,
         hook_message_sender=sender,
         correlation_id="corr-1",
@@ -1055,17 +1071,19 @@ async def test_integration_smoke_live_research() -> None:
         pytest.skip("no MindRoom models configured")
     context = ToolRuntimeContext(
         agent_name=os.getenv("MINDROOM_DEEP_RESEARCH_AGENT", "code"),
-        room_id="!deep-research-integration:localhost",
-        thread_id="$deep-research-integration",
-        resolved_thread_id="$deep-research-integration",
+        target=MessageTarget(
+            room_id="!deep-research-integration:localhost",
+            source_thread_id="$deep-research-integration",
+            resolved_thread_id="$deep-research-integration",
+            reply_to_event_id=None,
+            session_id="deep-research-integration",
+        ),
         requester_id="@deep-research-integration:localhost",
         client=AsyncMock(),
         config=config,
         runtime_paths=runtime_paths,
-        event_cache=AsyncMock(),
-        conversation_cache=AsyncMock(),
+        **_conversation_collaborators(),
         active_model_name=model_name,
-        session_id="deep-research-integration",
         correlation_id="deep-research-integration",
     )
 
