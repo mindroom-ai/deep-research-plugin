@@ -24,6 +24,7 @@ from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
     ToolCategory,
+    ToolFileAccess,
     ToolStatus,
 )
 from mindroom.tool_system.metadata import get_tool_by_name
@@ -864,6 +865,7 @@ _CONFIG_FIELDS = [
 
 @register_tool_with_metadata(
     name=TOOL_NAME,
+    file_access=ToolFileAccess.NONE,
     display_name="Deep Research",
     description=(
         "Run a bounded cited web-research loop using the caller's active MindRoom model. "
