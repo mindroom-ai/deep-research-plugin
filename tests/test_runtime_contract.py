@@ -4,7 +4,7 @@
 The plugin uses direct, typed access to MindRoom and agno APIs — no
 defensive probing. These assertions turn runtime version skew into a red
 test at vendor-bump time instead of silently degraded behavior at dispatch
-time. Minimum runtime: MindRoom v2026.7.99.
+time. Minimum runtime: MindRoom v2026.10.243.
 """
 
 from __future__ import annotations
