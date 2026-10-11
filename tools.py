@@ -19,7 +19,7 @@ from agno.tools.serper import SerperTools
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 from mindroom.logging_config import get_logger
-from mindroom.model_loading import get_model_instance
+from mindroom.providers.model_loading import get_model_instance
 from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
