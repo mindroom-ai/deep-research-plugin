@@ -79,6 +79,7 @@ flowchart TD
 | `deep_research(question, max_rounds=100, wall_clock_seconds=9000, model=None, verbosity="progress", max_queries_per_round=5, results_per_query=10, max_reads_per_round=10, page_char_limit=150000, report_token_cap=16000, parallel_researchers=1, extract_model=None, grounding=True, ground_model=None)` | Run a bounded, cited web-research loop for one question and return a JSON report envelope |
 
 The returned envelope includes `status`, `report` (Markdown with `[n]` citations), `sources`, `confidence`, `rounds_used`, `stopped_reason`, `elapsed_seconds`, any `warnings`, and `stats` (counts of searches, reads, extractions, retries skipped as duplicates, and failures).
+A run in which every search failed and no source was found returns `status: "error"` with the failures in `warnings`.
 `stopped_reason` is one of `confident`, `model_finished`, `no_progress`, `max_rounds`, `wall_clock`, or `synthesis_truncated` — only the last one means the final report itself was cut short; every other reason still ends with a fully synthesized report.
 
 Parameters:
@@ -119,6 +120,8 @@ agents:
 
 - `search_tool` — name of the registered tool to resolve for searches.
   If the calling agent's config also carries an entry for that tool (e.g. with project or API settings), those settings are reused when the search tool is built.
+  Settings that only hide functions from the agent itself (`enable_*` or `all` set to false, `include_tools`, `exclude_tools`) are not reused, so an agent that hides Serper's `search_web` from itself still gets web search here; an enabled function, such as Firecrawl's `enable_search: true`, stays enabled.
+  A search tool without its web function fails the run at once; a missing news or scholar function drops that kind and adds a warning.
 - `search_function` — a single function on that tool, called as `fn(query)` (a `num_results` keyword is passed only when the function accepts one).
   All query kinds (web/news/scholar) route to it.
   Leave unset for Serper's `search_web`/`search_news`/`search_scholar` routing.
@@ -151,7 +154,7 @@ agents:
 
 - The reasoner sees each channel's name and description in its planning prompt and picks the fitting channel per query; unknown kinds fall back to the web channel.
 - Channel functions are called like the main search function (`fn(query)`, with `num_results` only when accepted) and must return JSON in one of the shapes above — rows need a URL (or permalink) to enter the source registry.
-- Channel tools are resolved with the calling agent's authored overrides for that tool, like the main search backend, and with the calling agent's worker target — so OAuth-backed MCP channels use the requester's own connection (per-user sessions) instead of an unscoped session that is never signed in.
+- Channel tools are resolved with the calling agent's authored settings for that tool, without the ones that hide functions, like the main search backend, and with the calling agent's worker target — so OAuth-backed MCP channels use the requester's own connection (per-user sessions) instead of an unscoped session that is never signed in.
   An unavailable channel is dropped for the run and reported in the result's `warnings` instead of failing the research.
 - Channel names `web`, `news`, and `scholar` are reserved for the main backend.
 - Functions that take structured keyword arguments instead of a single query string — MCP tools in particular, including the `<prefix>_call_tool` bridge of OAuth-backed MCP servers — can be called through an `arguments` template with `{query}` and `{num_results}` placeholders.
