@@ -280,6 +280,42 @@ async def test_wall_clock_deadline_wraps_awaited_operations(
     assert any(warning_fragment in warning for warning in result.warnings)
 
 
+@pytest.mark.parametrize("cut_off", ["seed search", "round search after a failed seed"])
+@pytest.mark.asyncio
+async def test_a_search_cut_off_by_the_wall_clock_counts_as_failed(cut_off: str) -> None:
+    async def reason(_prompt: str) -> Any:
+        return loop.ResearchStep(
+            thought="search",
+            updated_report="partial",
+            open_questions=[],
+            confidence=0.1,
+            next_action="search",
+            search_queries=[loop.SearchQuery(query="round query")],
+        )
+
+    async def search(query: Any, _limit: int) -> list[Any]:
+        if cut_off != "seed search" and query.query == "q":
+            msg = "quota exceeded"
+            raise RuntimeError(msg)
+        return await _never()
+
+    result = await loop.run_research_loop(
+        question="q",
+        max_rounds=1,
+        wall_clock_seconds=60,
+        reason_fn=reason,
+        extract_fn=lambda _prompt: _await(loop.Extraction(facts=[], relevant=False)),
+        search_fn=search,
+        read_fn=lambda url: _await(loop.Page(url=url, title=url, text="text")),
+        synthesize_fn=_synthesize,
+        clock=_almost_expired_clock(),
+    )
+
+    assert result.stopped_reason == "wall_clock"
+    assert result.stats["searches"] >= 1
+    assert result.stats["search_failures"] == result.stats["searches"]
+
+
 @pytest.mark.asyncio
 async def test_no_progress_stops_after_duplicate_url_rounds() -> None:
     calls = 0

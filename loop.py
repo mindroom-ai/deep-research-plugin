@@ -864,6 +864,7 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
     try:
         seed_hits = await _search_once(seed_query, "seed search")
     except _WallClockExpired as exc:
+        stats["search_failures"] += 1
         warnings.append(_wall_clock_warning(exc.label))
         seed_hits = []
         stopped_reason = "wall_clock"
@@ -1041,7 +1042,9 @@ async def run_research_loop(  # noqa: C901, PLR0912, PLR0915
         async def search_worker(index: int, query: SearchQuery, phase: list[str]) -> None:
             try:
                 search_results[index] = await _search_once(query, phase[0])
-            except _WallClockExpired:
+            except (_WallClockExpired, asyncio.CancelledError):
+                # The wall clock cut this search off, either here or by cancelling its batch.
+                stats["search_failures"] += 1
                 raise
             except _OpTimeoutError:
                 stats["search_failures"] += 1
