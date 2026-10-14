@@ -438,19 +438,20 @@ def _result_text(raw: object) -> str:
     raise TypeError(msg)
 
 
-def _is_function_toggle(key: str) -> bool:
-    # Agno toolkits name their function switches `enable_<function>` and `all`.
-    return key in {"all", "include_tools", "exclude_tools"} or key.startswith("enable_")
+def _hides_functions(key: str, value: object) -> bool:
+    # Agno toolkits name their function switches `enable_<function>` and `all`; an enabled one is kept,
+    # since some functions, such as Firecrawl's search, are off unless enabled.
+    return key in {"include_tools", "exclude_tools"} or ((key == "all" or key.startswith("enable_")) and not value)
 
 
 def _authored_tool_overrides(context: ToolRuntimeContext, tool_name: str) -> dict[str, object]:
-    """Return the calling agent's settings for one tool, without the toggles that pick the agent's own functions.
+    """Return the calling agent's settings for one tool, without the toggles that hide functions from the agent.
 
     An agent may hide a function from itself, for example a second `search_web`, while this tool still calls it.
     """
     for entry in context.config.get_agent(context.agent_name).tools:
         if entry.name == tool_name:
-            return {key: value for key, value in entry.overrides.items() if not _is_function_toggle(key)}
+            return {key: value for key, value in entry.overrides.items() if not _hides_functions(key, value)}
     return {}
 
 

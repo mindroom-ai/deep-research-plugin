@@ -1072,7 +1072,20 @@ def test_authored_tool_overrides_leave_out_the_agents_function_toggles() -> None
     agent = SimpleNamespace(tools=[SimpleNamespace(name="serper", overrides=overrides)])
     context = SimpleNamespace(agent_name="code", config=SimpleNamespace(get_agent=lambda _name: agent))
 
-    assert module._authored_tool_overrides(context, "serper") == {"num_results": 10, "location": "nl"}
+    assert module._authored_tool_overrides(context, "serper") == {
+        "enable_search_scholar": True,
+        "num_results": 10,
+        "location": "nl",
+    }
+
+
+def test_authored_tool_overrides_keep_an_enable_for_a_function_that_defaults_off() -> None:
+    module = _load_tools_module()
+    overrides = {"enable_search": True, "enable_crawl": False, "all": True}
+    agent = SimpleNamespace(tools=[SimpleNamespace(name="firecrawl", overrides=overrides)])
+    context = SimpleNamespace(agent_name="code", config=SimpleNamespace(get_agent=lambda _name: agent))
+
+    assert module._authored_tool_overrides(context, "firecrawl") == {"enable_search": True, "all": True}
 
 
 def test_search_toolkit_keeps_the_searches_an_agent_hid_from_itself() -> None:
