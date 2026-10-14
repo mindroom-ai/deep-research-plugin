@@ -438,11 +438,19 @@ def _result_text(raw: object) -> str:
     raise TypeError(msg)
 
 
+def _is_function_toggle(key: str) -> bool:
+    # Agno toolkits name their function switches `enable_<function>` and `all`.
+    return key in {"all", "include_tools", "exclude_tools"} or key.startswith("enable_")
+
+
 def _authored_tool_overrides(context: ToolRuntimeContext, tool_name: str) -> dict[str, object]:
-    """Return the calling agent's authored config overrides for one tool."""
+    """Return the calling agent's settings for one tool, without the toggles that pick the agent's own functions.
+
+    An agent may hide a function from itself, for example a second `search_web`, while this tool still calls it.
+    """
     for entry in context.config.get_agent(context.agent_name).tools:
         if entry.name == tool_name:
-            return dict(entry.overrides)
+            return {key: value for key, value in entry.overrides.items() if not _is_function_toggle(key)}
     return {}
 
 
@@ -636,11 +644,26 @@ class DeepResearchTools(Toolkit):
                 "Configure its API key to use deep_research.",
             )
 
+        # The search tool must answer web queries; a missing news or scholar
+        # search is dropped with a warning, like an extra channel below.
+        channel_warnings: list[str] = []
+        wanted_functions = {"web": self.search_function} if self.search_function else SERPER_SEARCH_FUNCTIONS
+        search_functions: dict[str, str] = {}
+        for kind, function_name in wanted_functions.items():
+            try:
+                _tool_function_entrypoint(search_toolkit, function_name)
+            except RuntimeError as exc:
+                if kind == "web":
+                    return _error(f"Search tool '{search_tool_name}' cannot search the web: {exc}")
+                LOGGER.warning("deep_research_search_kind_unavailable", kind=kind, error=str(exc))
+                channel_warnings.append(f"search kind '{kind}' unavailable: {exc}")
+                continue
+            search_functions[kind] = function_name
+
         # Extra search channels degrade gracefully: an unavailable channel is
         # dropped (and reported in warnings) instead of failing the run, and
         # the reasoner is only told about channels that actually resolved.
         channels: dict[str, _ResolvedChannel] = {}
-        channel_warnings: list[str] = []
         channel_worker_target: ResolvedWorkerTarget | None = None
         channel_shared_services: frozenset[str] | None = None
         if self.search_channels:
@@ -676,10 +699,7 @@ class DeepResearchTools(Toolkit):
                 arguments=channel_config.arguments,
             )
 
-        if self.search_function:
-            prompt_channels = [("web", BASE_CHANNEL_DESCRIPTIONS["web"])]
-        else:
-            prompt_channels = [(name, BASE_CHANNEL_DESCRIPTIONS[name]) for name in ("web", "news", "scholar")]
+        prompt_channels = [(kind, BASE_CHANNEL_DESCRIPTIONS[kind]) for kind in search_functions]
         prompt_channels.extend((name, channel.description) for name, channel in channels.items())
 
         try:
@@ -749,11 +769,7 @@ class DeepResearchTools(Toolkit):
                     arguments=channel.arguments,
                 )
             else:
-                search_method = (
-                    self.search_function
-                    or SERPER_SEARCH_FUNCTIONS.get(query.kind)
-                    or SERPER_SEARCH_FUNCTIONS["web"]
-                )
+                search_method = search_functions.get(query.kind, search_functions["web"])
                 raw = await _call_search_function(search_toolkit, search_method, query.query, num_results=limit)
             return _parse_search_results(raw)
 
@@ -811,6 +827,10 @@ class DeepResearchTools(Toolkit):
         except Exception as exc:
             LOGGER.warning("deep_research_loop_failed", error=str(exc))
             return _error(f"deep_research failed: {exc}", warnings=channel_warnings)
+
+        searches = result.stats.get("searches", 0)
+        if not result.sources and searches and result.stats.get("search_failures", 0) >= searches:
+            return _error("Every search failed, so deep_research found no sources.", warnings=result.warnings)
 
         return _payload(
             "ok",

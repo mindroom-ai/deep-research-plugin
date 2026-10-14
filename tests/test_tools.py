@@ -20,6 +20,7 @@ from uuid import uuid4
 import pytest
 
 from agno.tools.function import ToolResult
+from agno.tools.serper import SerperTools
 
 from mindroom.config.main import Config, load_config
 from mindroom.constants import resolve_primary_runtime_paths
@@ -685,6 +686,7 @@ async def test_tool_function_entrypoints_are_used_for_search_and_read() -> None:
     class EntrypointSerper(_FakeSerper):
         def __init__(self) -> None:
             self.functions = {"search_web": _entrypoint(self.entrypoint_search_web)}
+            self.async_functions = {}
 
         def entrypoint_search_web(self, query: str, num_results: int | None = None) -> str:
             return json.dumps({"organic": [{"link": "https://example.com", "title": query, "snippet": str(num_results)}]})
@@ -771,7 +773,7 @@ async def test_serper_error_payload_returns_search_warning() -> None:
     ):
         result = json.loads(await tools.deep_research("What?", verbosity="silent"))
 
-    assert result["status"] == "ok"
+    assert result["status"] == "error"
     assert result["warnings"] == ["seed search failed: quota exceeded"]
 
 
@@ -1053,6 +1055,126 @@ def test_authored_tool_overrides_reads_typed_agent_entries() -> None:
 
     assert module._authored_tool_overrides(context, "object_search") == {"project_id": "object-project"}
     assert module._authored_tool_overrides(context, "unlisted_search") == {}
+
+
+def test_authored_tool_overrides_leave_out_the_agents_function_toggles() -> None:
+    module = _load_tools_module()
+    overrides = {
+        "all": False,
+        "enable_search": False,
+        "enable_search_news": False,
+        "enable_search_scholar": True,
+        "include_tools": ["search_scholar"],
+        "exclude_tools": ["search_web"],
+        "num_results": 10,
+        "location": "nl",
+    }
+    agent = SimpleNamespace(tools=[SimpleNamespace(name="serper", overrides=overrides)])
+    context = SimpleNamespace(agent_name="code", config=SimpleNamespace(get_agent=lambda _name: agent))
+
+    assert module._authored_tool_overrides(context, "serper") == {"num_results": 10, "location": "nl"}
+
+
+def test_search_toolkit_keeps_the_searches_an_agent_hid_from_itself() -> None:
+    module = _load_tools_module()
+    hidden = {"enable_search": False, "enable_search_news": False, "enable_scrape_webpage": False, "num_results": 7}
+    agent = SimpleNamespace(tools=[SimpleNamespace(name="serper", overrides=hidden)])
+    context = SimpleNamespace(agent_name="code", config=SimpleNamespace(get_agent=lambda _name: agent))
+
+    toolkit = SerperTools(api_key="key", **module._authored_tool_overrides(context, "serper"))
+
+    assert {"search_web", "search_news", "search_scholar"} <= set(toolkit.functions)
+    assert toolkit.num_results == 7
+
+
+def _serper_with(*names: str) -> Any:
+    serper = _FakeSerper()
+    serper.functions = {name: function for name, function in serper.functions.items() if name in names}
+    return serper
+
+
+@pytest.mark.asyncio
+async def test_a_search_tool_that_cannot_search_the_web_fails_before_research() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+    loop = AsyncMock(return_value=_result(module))
+
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
+        if name == "serper":
+            return _serper_with("search_scholar")
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", loop),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "error"
+    assert "search_web" in result["message"]
+    loop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_search_kind_the_tool_lacks_is_dropped_and_falls_back_to_web() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+    loop = AsyncMock(return_value=_result(module))
+    serper = _serper_with("search_web", "search_scholar")
+    serper.search_web = Mock(return_value=json.dumps({"organic": []}))
+    serper.functions["search_web"] = _entrypoint(serper.search_web)
+
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
+        if name == "serper":
+            return serper
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", loop),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+        search_fn = loop.await_args.kwargs["search_fn"]
+        await search_fn(_load_loop_module().SearchQuery(query="latest", kind="news"), 3)
+
+    assert result["status"] == "ok"
+    assert [name for name, _description in loop.await_args.kwargs["search_channels"]] == ["web", "scholar"]
+    assert any("news" in warning and "search_news" in warning for warning in result["warnings"])
+    serper.search_web.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_a_run_whose_every_search_failed_and_found_no_sources_is_an_error() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+    failed = _result(module)
+    failed.sources = []
+    failed.sources_used = 0
+    failed.warnings = ["seed search failed: quota exceeded"]
+    failed.stats = {"searches": 2, "search_attempts": 3, "search_failures": 2, "reads": 0}
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
+        patch.object(module, "run_research_loop", AsyncMock(return_value=failed)),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "error"
+    assert result["message"] == "Every search failed, so deep_research found no sources."
+    assert result["warnings"] == ["seed search failed: quota exceeded"]
 
 
 @pytest.mark.skipif(
