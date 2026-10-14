@@ -1190,6 +1190,33 @@ async def test_a_run_whose_every_search_failed_and_found_no_sources_is_an_error(
     assert result["warnings"] == ["seed search failed: quota exceeded"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failures", "has_sources"),
+    [(2, False), (3, True)],
+    ids=["a search worked but found nothing", "every search failed but a read found a source"],
+)
+async def test_a_run_with_a_working_search_or_a_source_stays_ok(failures: int, has_sources: bool) -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+    partial = _result(module)
+    if not has_sources:
+        partial.sources = []
+        partial.sources_used = 0
+    partial.stats = {"searches": 3, "search_attempts": 3, "search_failures": failures, "reads": 1}
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        patch.object(module, "get_model_instance", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
+        patch.object(module, "run_research_loop", AsyncMock(return_value=partial)),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+
+
 @pytest.mark.skipif(
     os.getenv("MINDROOM_DEEP_RESEARCH_INTEGRATION") != "1",
     reason="set MINDROOM_DEEP_RESEARCH_INTEGRATION=1 for live MindRoom integration smoke test",
