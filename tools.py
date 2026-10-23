@@ -10,7 +10,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from agno.agent import Agent
 from agno.tools import Toolkit
@@ -19,7 +19,13 @@ from agno.tools.serper import SerperTools
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 from mindroom.logging_config import get_logger
-from mindroom.providers.model_loading import get_model_instance
+try:  # MindRoom's own model runtime
+    from mindroom.agent_loop.helper import complete_prompt
+    from mindroom.providers.registry import build_model_provider
+except ImportError:  # earlier MindRoom releases, which run Agno models
+    complete_prompt = None
+    build_model_provider = None
+    from mindroom.providers.model_loading import get_model_instance
 from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
@@ -594,7 +600,7 @@ class DeepResearchTools(Toolkit):
             extract_model_name = _resolve_model_name(context, extract_model) if extract_model else model_name
             ground_model_name = _resolve_model_name(context, ground_model) if ground_model else model_name
             execution_identity = build_execution_identity_from_runtime_context(context)
-            live_model = get_model_instance(
+            live_model = _load_model(
                 context.config,
                 context.runtime_paths,
                 model_name,
@@ -603,7 +609,7 @@ class DeepResearchTools(Toolkit):
             extract_live_model = (
                 live_model
                 if extract_model_name == model_name
-                else get_model_instance(
+                else _load_model(
                     context.config,
                     context.runtime_paths,
                     extract_model_name,
@@ -613,7 +619,7 @@ class DeepResearchTools(Toolkit):
             ground_live_model = (
                 live_model
                 if ground_model_name == model_name
-                else get_model_instance(
+                else _load_model(
                     context.config,
                     context.runtime_paths,
                     ground_model_name,
@@ -721,43 +727,40 @@ class DeepResearchTools(Toolkit):
 
         async def reason_fn(prompt: str) -> object:
             counters["reason"] += 1
-            agent = Agent(
-                model=live_model,
-                output_schema=ResearchStep,
-                telemetry=False,
-                markdown=False,
+            return await _ask_model(
+                live_model,
+                prompt,
+                schema=ResearchStep,
+                session_id=_session_id(context, "reason", counters["reason"]),
             )
-            response = await agent.arun(prompt, session_id=_session_id(context, "reason", counters["reason"]))
-            return response.content
 
         async def extract_fn(prompt: str) -> object:
             counters["extract"] += 1
-            agent = Agent(
-                model=extract_live_model,
-                output_schema=Extraction,
-                telemetry=False,
-                markdown=False,
+            return await _ask_model(
+                extract_live_model,
+                prompt,
+                schema=Extraction,
+                session_id=_session_id(context, "extract", counters["extract"]),
             )
-            response = await agent.arun(prompt, session_id=_session_id(context, "extract", counters["extract"]))
-            return response.content
 
         async def synthesize_fn(prompt: str) -> str:
             counters["synthesize"] += 1
-            agent = Agent(model=live_model, telemetry=False, markdown=False)
-            response = await agent.arun(prompt, session_id=_session_id(context, "synthesize", counters["synthesize"]))
-            content = response.content
+            content = await _ask_model(
+                live_model,
+                prompt,
+                schema=None,
+                session_id=_session_id(context, "synthesize", counters["synthesize"]),
+            )
             return content if isinstance(content, str) else str(content)
 
         async def ground_fn(prompt: str) -> object:
             counters["ground"] += 1
-            agent = Agent(
-                model=ground_live_model,
-                output_schema=GroundingCheck,
-                telemetry=False,
-                markdown=False,
+            return await _ask_model(
+                ground_live_model,
+                prompt,
+                schema=GroundingCheck,
+                session_id=_session_id(context, "ground", counters["ground"]),
             )
-            response = await agent.arun(prompt, session_id=_session_id(context, "ground", counters["ground"]))
-            return response.content
 
         async def search_fn(query: SearchQuery, limit: int) -> list[SearchHit]:
             channel = channels.get(query.kind)
@@ -847,6 +850,29 @@ class DeepResearchTools(Toolkit):
             warnings=result.warnings,
             stats=result.stats,
         )
+
+
+def _load_model(
+    config: Any,
+    runtime_paths: Any,
+    model_name: str,
+    *,
+    execution_identity: Any,
+) -> Any:
+    """Return the configured model: an owned provider, or an Agno model on earlier MindRoom releases."""
+    if build_model_provider is not None:
+        return build_model_provider(config, runtime_paths, model_name, execution_identity=execution_identity)
+    return get_model_instance(config, runtime_paths, model_name, execution_identity=execution_identity)
+
+
+async def _ask_model(model: Any, prompt: str, *, schema: type[BaseModel] | None, session_id: str) -> object:
+    """Send one prompt to ``model`` and return its content, parsed into ``schema`` when it parses."""
+    if complete_prompt is not None:
+        response = await complete_prompt(model, prompt, schema=schema)
+        return response.content
+    agent = Agent(model=model, output_schema=schema, telemetry=False, markdown=False)
+    response = await agent.arun(prompt, session_id=session_id)
+    return response.content
 
 
 _CONFIG_FIELDS = [
