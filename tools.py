@@ -19,12 +19,14 @@ from agno.tools.serper import SerperTools
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 from mindroom.logging_config import get_logger
-try:  # MindRoom's own model runtime
+try:  # MindRoom's own model runtime and tool values
     from mindroom.agent_loop.helper import complete_prompt
     from mindroom.providers.registry import build_model_provider
+    from mindroom.tool_system.tool_function import ToolValue
 except ImportError:  # earlier MindRoom releases, which run Agno models
     complete_prompt = None
     build_model_provider = None
+    ToolValue = None
     from mindroom.providers.model_loading import get_model_instance
 from mindroom.tool_system.declarations import (
     ConfigField,
@@ -433,12 +435,13 @@ def _result_text(raw: object) -> str:
     """Normalize a search call's return value to text.
 
     Search callables return plain text; MindRoom's MCP toolkits return an
-    agno ToolResult whose content is already normalized to a string.
+    agno ToolResult or a MindRoom ToolValue whose content is already
+    normalized to a string.
     Anything else is a contract violation and fails loudly.
     """
     if isinstance(raw, str):
         return raw
-    if isinstance(raw, ToolResult):
+    if isinstance(raw, ToolResult) or (ToolValue is not None and isinstance(raw, ToolValue)):
         return raw.content
     msg = f"Search function returned an unsupported result type: {type(raw).__name__}"
     raise TypeError(msg)
