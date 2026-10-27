@@ -1623,11 +1623,13 @@ def test_substitute_placeholders_does_not_reexpand_placeholder_text_in_query() -
     assert substituted == {"note": "q=find {num_results} docs limit=5"}
 
 
-def test_result_text_accepts_str_and_tool_result_and_rejects_everything_else() -> None:
+def test_result_text_accepts_str_and_tool_results_and_rejects_everything_else() -> None:
     module = _load_tools_module()
 
     assert module._result_text("already text") == "already text"
     assert module._result_text(ToolResult(content='{"results": []}')) == '{"results": []}'
+    if module.ToolValue is not None:  # MindRoom releases with their own tool values
+        assert module._result_text(module.ToolValue(content='{"results": []}')) == '{"results": []}'
     with pytest.raises(TypeError, match="unsupported result type"):
         module._result_text(42)
 
