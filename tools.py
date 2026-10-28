@@ -109,12 +109,12 @@ class _ChannelConfig(BaseModel):
 def _coerce_channel_entries(raw: object) -> list[object]:
     """Expand raw channel config into a list of entry objects.
 
-    MindRoom validates per-agent string[] overrides as lists of strings and
-    hands them to the constructor comma-joined into ONE string, so channels
+    MindRoom validates string[] settings as lists of strings, so channels
     with structured fields (arguments templates) must be authored as JSON
-    object strings. Wrapping the joined form in brackets re-parses it as a
-    JSON array regardless of commas inside quoted values; individual JSON
-    object strings inside lists are decoded the same way.
+    object strings; each JSON object string in the list is decoded. A single
+    string, such as a comma-joined list, is also accepted: wrapping it in
+    brackets re-parses it as a JSON array regardless of commas inside
+    quoted values.
     """
     if isinstance(raw, str):
         text = raw.strip()
