@@ -65,7 +65,7 @@ flowchart TD
 ```
 
 1. An agent calls `deep_research(question)` in a thread.
-2. The plugin resolves the caller's active model and builds an ephemeral, tool-less reasoning agent.
+2. The plugin resolves the caller's active model and sends each reasoning step to it as one tool-less request.
 3. Each round: the reasoner plans searches and/or page reads (both may run in the same round), which execute concurrently with retries and per-operation timeouts; extracted facts are folded into a rolling report with stable citations and banked per source.
 4. Between rounds the report is compressed (summarize-and-replace) so context stays bounded; the fact bank preserves evidence the compression drops.
 5. The loop stops on high evidence-backed confidence, on no further progress, or when the round/wall-clock budget runs out.
@@ -142,14 +142,8 @@ agents:
           search_tool: my_search
           search_function: search
           search_channels:
-            - name: wiki
-              description: Internal documentation and runbooks
-              tool: my_wiki_tool
-              function: search_documents
-            - name: chat
-              description: Team chat history
-              tool: my_chat_search
-              function: search_messages
+            - '{"name": "wiki", "description": "Internal documentation and runbooks", "tool": "my_wiki_tool", "function": "search_documents"}'
+            - '{"name": "chat", "description": "Team chat history", "tool": "my_chat_search", "function": "search_messages"}'
 ```
 
 - The reasoner sees each channel's name and description in its planning prompt and picks the fitting channel per query; unknown kinds fall back to the web channel.
@@ -185,10 +179,6 @@ agents:
   ```
 
   Plain YAML mappings remain supported wherever config reaches the tool unconverted (global tool config, direct construction).
-
-## Requirements
-
-MindRoom **v2026.10.243 or newer**: the plugin imports model loading from `mindroom.providers`, uses the split tool declaration/registration API, and resolves search-channel toolkits through the typed `ToolRuntimeContext.resolve_worker_target()` API so OAuth-backed MCP channels use the requester's own connection. There is deliberately no fallback for older runtimes — channel resolution fails with a clear error instead of degrading to an unscoped session that can never be signed in.
 
 ## Install
 
