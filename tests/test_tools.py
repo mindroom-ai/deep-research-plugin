@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 PACKAGE_NAME = f"mindroom_plugin_{Path(__file__).resolve().parents[1].name.replace('-', '_')}"
 
+
 def _load_tools_module() -> ModuleType:
     tools_path = Path(__file__).resolve().parents[1] / "tools.py"
     module_name = f"{PACKAGE_NAME}.tools_test_{uuid4().hex}"
@@ -249,14 +250,14 @@ async def test_model_override_precedence_and_execution_identity_are_wired() -> N
     with (
         tool_runtime_context(context),
         patch.object(module, "build_execution_identity_from_runtime_context", return_value=execution_identity),
-        patch.object(module, "build_model_provider", return_value=object()) as get_model,
+        patch.object(module, "build_model_provider", return_value=object()) as build_provider,
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
     ):
         result = json.loads(await tools.deep_research("What?", model="override"))
 
     assert result["status"] == "ok"
-    get_model.assert_called_once_with(
+    build_provider.assert_called_once_with(
         context.config,
         context.runtime_paths,
         "override",
@@ -274,14 +275,14 @@ async def test_active_model_precedes_runtime_resolution() -> None:
     with (
         tool_runtime_context(context),
         patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
-        patch.object(module, "build_model_provider", return_value=object()) as get_model,
+        patch.object(module, "build_model_provider", return_value=object()) as build_provider,
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
     ):
         result = json.loads(await tools.deep_research("What?"))
 
     assert result["status"] == "ok"
-    assert get_model.call_args.args[2] == "active"
+    assert build_provider.call_args.args[2] == "active"
     context.config.resolve_runtime_model.assert_not_called()
 
 
@@ -295,14 +296,14 @@ async def test_runtime_model_resolution_fallback_when_no_active_model() -> None:
     with (
         tool_runtime_context(context),
         patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
-        patch.object(module, "build_model_provider", return_value=object()) as get_model,
+        patch.object(module, "build_model_provider", return_value=object()) as build_provider,
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
     ):
         result = json.loads(await tools.deep_research("What?"))
 
     assert result["status"] == "ok"
-    assert get_model.call_args.args[2] == "resolved"
+    assert build_provider.call_args.args[2] == "resolved"
     resolver.assert_called_once_with(
         entity_name="code",
         room_id="!room:localhost",
@@ -318,14 +319,14 @@ async def test_unknown_model_override_returns_error_envelope() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_model_provider", return_value=object()) as get_model,
+        patch.object(module, "build_model_provider", return_value=object()) as build_provider,
         patch.object(module, "run_research_loop", AsyncMock()) as loop_mock,
     ):
         result = json.loads(await tools.deep_research("What?", model="bogus"))
 
     assert result["status"] == "error"
     assert "Unknown model override: bogus" in result["message"]
-    get_model.assert_not_called()
+    build_provider.assert_not_called()
     loop_mock.assert_not_called()
 
 
@@ -337,14 +338,14 @@ async def test_extract_model_routes_to_separate_model_instance() -> None:
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
         patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
-        patch.object(module, "build_model_provider", side_effect=[object(), object()]) as get_model,
+        patch.object(module, "build_model_provider", side_effect=[object(), object()]) as build_provider,
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
     ):
         result = json.loads(await tools.deep_research("What?", extract_model="override"))
 
     assert result["status"] == "ok"
-    assert [call.args[2] for call in get_model.call_args_list] == ["active", "override"]
+    assert [call.args[2] for call in build_provider.call_args_list] == ["active", "override"]
 
 
 @pytest.mark.asyncio
@@ -651,13 +652,13 @@ async def test_malformed_numeric_args_return_error_envelope(kwargs: dict[str, ob
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_model_provider", return_value=object()) as get_model,
+        patch.object(module, "build_model_provider", return_value=object()) as build_provider,
         patch.object(module, "run_research_loop", AsyncMock()) as loop_mock,
     ):
         result = json.loads(await tools.deep_research("What?", **kwargs))
 
     assert result["status"] == "error"
-    get_model.assert_not_called()
+    build_provider.assert_not_called()
     loop_mock.assert_not_called()
 
 
@@ -1730,14 +1731,14 @@ async def test_ground_model_routes_to_separate_model_instance() -> None:
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
         patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
-        patch.object(module, "build_model_provider", side_effect=[object(), object()]) as get_model,
+        patch.object(module, "build_model_provider", side_effect=[object(), object()]) as build_provider,
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
     ):
         result = json.loads(await tools.deep_research("What?", ground_model="override"))
 
     assert result["status"] == "ok"
-    assert [call.args[2] for call in get_model.call_args_list] == ["active", "override"]
+    assert [call.args[2] for call in build_provider.call_args_list] == ["active", "override"]
 
 
 def test_round_progress_shows_open_question_count() -> None:
