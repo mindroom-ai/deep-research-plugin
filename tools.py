@@ -35,6 +35,7 @@ from mindroom.tool_system.runtime_context import (
     resolve_tool_runtime_hook_bindings,
 )
 from mindroom.tool_system.tool_function import ToolValue
+from mindroom.turn_model import ModelScope, resolve_turn_model
 
 if TYPE_CHECKING:
     from mindroom.llm.provider import ModelProvider
@@ -232,13 +233,8 @@ def _resolve_model_name(context: ToolRuntimeContext, model: str | None) -> str:
         return model
     if context.active_model_name:
         return context.active_model_name
-    resolved = context.config.resolve_runtime_model(
-        entity_name=context.agent_name,
-        room_id=context.room_id,
-        thread_id=context.resolved_thread_id,
-        runtime_paths=context.runtime_paths,
-    )
-    return resolved.model_name
+    scope = ModelScope(entity=context.agent_name, room_id=context.room_id, thread_id=context.resolved_thread_id)
+    return resolve_turn_model(context.config, context.runtime_paths, scope, None).model_name
 
 
 def _extract_text_from_website_payload(payload: str) -> tuple[str, str]:

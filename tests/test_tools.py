@@ -21,7 +21,9 @@ import pytest
 from agno.tools.function import ToolResult
 from agno.tools.serper import SerperTools
 
+from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config, load_config
+from mindroom.config.models import DefaultsConfig
 from mindroom.constants import resolve_primary_runtime_paths
 from mindroom.message_target import MessageTarget
 from mindroom.tool_system.declarations import SetupType, ToolStatus
@@ -61,17 +63,14 @@ def _tool_context(
     *,
     sender: AsyncMock | None = None,
     active_model_name: str | None = "active",
-    resolve_runtime_model: Mock | None = None,
 ) -> ToolRuntimeContext:
-    resolver = resolve_runtime_model or Mock(return_value=SimpleNamespace(model_name="resolved"))
-    agent = SimpleNamespace(tools=[], private=None)
+    agent = AgentConfig(display_name="Code")
     config = SimpleNamespace(
         models={"active": object(), "override": object(), "resolved": object()},
-        resolve_runtime_model=resolver,
         debug=SimpleNamespace(log_llm_requests=False),
         agents={"code": agent},
+        defaults=DefaultsConfig(),
         get_agent=lambda _name, _agent=agent: _agent,
-        resolve_entity=lambda _name: SimpleNamespace(execution_scope=None),
         get_worker_grantable_credentials=lambda: frozenset(),
     )
     return ToolRuntimeContext(
@@ -253,6 +252,7 @@ async def test_model_override_precedence_and_execution_identity_are_wired() -> N
         patch.object(module, "build_model_provider", return_value=object()) as build_provider,
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
+        patch.object(module, "resolve_turn_model") as resolve_model,
     ):
         result = json.loads(await tools.deep_research("What?", model="override"))
 
@@ -263,7 +263,7 @@ async def test_model_override_precedence_and_execution_identity_are_wired() -> N
         "override",
         execution_identity=execution_identity,
     )
-    context.config.resolve_runtime_model.assert_not_called()
+    resolve_model.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -278,20 +278,20 @@ async def test_active_model_precedes_runtime_resolution() -> None:
         patch.object(module, "build_model_provider", return_value=object()) as build_provider,
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
+        patch.object(module, "resolve_turn_model") as resolve_model,
     ):
         result = json.loads(await tools.deep_research("What?"))
 
     assert result["status"] == "ok"
     assert build_provider.call_args.args[2] == "active"
-    context.config.resolve_runtime_model.assert_not_called()
+    resolve_model.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_runtime_model_resolution_fallback_when_no_active_model() -> None:
     module = _load_tools_module()
     tools = module.DeepResearchTools()
-    resolver = Mock(return_value=SimpleNamespace(model_name="resolved"))
-    context = _tool_context(sender=AsyncMock(), active_model_name=None, resolve_runtime_model=resolver)
+    context = _tool_context(sender=AsyncMock(), active_model_name=None)
 
     with (
         tool_runtime_context(context),
@@ -299,16 +299,21 @@ async def test_runtime_model_resolution_fallback_when_no_active_model() -> None:
         patch.object(module, "build_model_provider", return_value=object()) as build_provider,
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
+        patch.object(
+            module,
+            "resolve_turn_model",
+            return_value=SimpleNamespace(model_name="resolved"),
+        ) as resolve_model,
     ):
         result = json.loads(await tools.deep_research("What?"))
 
     assert result["status"] == "ok"
     assert build_provider.call_args.args[2] == "resolved"
-    resolver.assert_called_once_with(
-        entity_name="code",
-        room_id="!room:localhost",
-        thread_id="$thread-root",
-        runtime_paths=context.runtime_paths,
+    resolve_model.assert_called_once_with(
+        context.config,
+        context.runtime_paths,
+        module.ModelScope(entity="code", room_id="!room:localhost", thread_id="$thread-root"),
+        None,
     )
 
 
@@ -635,7 +640,7 @@ async def test_tool_resolution_keeps_sandbox_proxy_enabled() -> None:
 
     assert result["status"] == "ok"
     assert calls
-    assert all(call.get("disable_sandbox_proxy") is not True for call in calls)
+    assert all(call.get("runs_in_worker") is not False for call in calls)
 
 
 @pytest.mark.parametrize(
@@ -989,7 +994,7 @@ async def test_search_tool_resolution_uses_calling_agents_authored_overrides() -
     tools = module.DeepResearchTools(search_tool="grounded_search", search_function="search_public_web")
     context = _tool_context(sender=AsyncMock())
     context.config.agents["code"].tools = [
-        SimpleNamespace(name="grounded_search", overrides={"project_id": "demo-project"}),
+        {"grounded_search": {"project_id": "demo-project"}},
     ]
     calls: list[tuple[str, Any]] = []
 
@@ -1413,7 +1418,7 @@ async def test_search_channel_tools_resolve_with_agent_authored_overrides() -> N
     )
     context = _tool_context(sender=AsyncMock())
     context.config.agents["code"].tools = [
-        SimpleNamespace(name="wiki_tool", overrides={"collection": "engineering"}),
+        {"wiki_tool": {"collection": "engineering"}},
     ]
     calls: list[tuple[str, Any]] = []
 
