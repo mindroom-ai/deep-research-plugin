@@ -10,24 +10,16 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from agno.agent import Agent
 from agno.tools import Toolkit
 from agno.tools.function import ToolResult
 from agno.tools.serper import SerperTools
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
+from mindroom.agent_loop.helper import complete_prompt
 from mindroom.logging_config import get_logger
-try:  # MindRoom's own model runtime and tool values
-    from mindroom.agent_loop.helper import complete_prompt
-    from mindroom.providers.registry import build_model_provider
-    from mindroom.tool_system.tool_function import ToolValue
-except ImportError:  # earlier MindRoom releases, which run Agno models
-    complete_prompt = None
-    build_model_provider = None
-    ToolValue = None
-    from mindroom.providers.model_loading import get_model_instance
+from mindroom.providers.registry import build_model_provider
 from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
@@ -42,8 +34,10 @@ from mindroom.tool_system.runtime_context import (
     get_tool_runtime_context,
     resolve_tool_runtime_hook_bindings,
 )
+from mindroom.tool_system.tool_function import ToolValue
 
 if TYPE_CHECKING:
+    from mindroom.llm.provider import ModelProvider
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
@@ -247,11 +241,6 @@ def _resolve_model_name(context: ToolRuntimeContext, model: str | None) -> str:
     return resolved.model_name
 
 
-def _session_id(context: ToolRuntimeContext, role: str, count: int) -> str:
-    base = context.session_id or context.correlation_id or context.resolved_thread_id or context.room_id
-    return f"deep-research:{base}:{role}:{count}"
-
-
 def _extract_text_from_website_payload(payload: str) -> tuple[str, str]:
     try:
         parsed = json.loads(payload)
@@ -441,7 +430,7 @@ def _result_text(raw: object) -> str:
     """
     if isinstance(raw, str):
         return raw
-    if isinstance(raw, ToolResult) or (ToolValue is not None and isinstance(raw, ToolValue)):
+    if isinstance(raw, (ToolResult, ToolValue)):
         return raw.content
     msg = f"Search function returned an unsupported result type: {type(raw).__name__}"
     raise TypeError(msg)
@@ -603,7 +592,7 @@ class DeepResearchTools(Toolkit):
             extract_model_name = _resolve_model_name(context, extract_model) if extract_model else model_name
             ground_model_name = _resolve_model_name(context, ground_model) if ground_model else model_name
             execution_identity = build_execution_identity_from_runtime_context(context)
-            live_model = _load_model(
+            live_model = build_model_provider(
                 context.config,
                 context.runtime_paths,
                 model_name,
@@ -612,7 +601,7 @@ class DeepResearchTools(Toolkit):
             extract_live_model = (
                 live_model
                 if extract_model_name == model_name
-                else _load_model(
+                else build_model_provider(
                     context.config,
                     context.runtime_paths,
                     extract_model_name,
@@ -622,7 +611,7 @@ class DeepResearchTools(Toolkit):
             ground_live_model = (
                 live_model
                 if ground_model_name == model_name
-                else _load_model(
+                else build_model_provider(
                     context.config,
                     context.runtime_paths,
                     ground_model_name,
@@ -677,8 +666,7 @@ class DeepResearchTools(Toolkit):
         channel_worker_target: ResolvedWorkerTarget | None = None
         channel_shared_services: frozenset[str] | None = None
         if self.search_channels:
-            # Requires MindRoom >= v2026.7.99 (ToolRuntimeContext.resolve_worker_target);
-            # older runtimes fail loudly here rather than degrading to an
+            # A resolution failure propagates rather than degrading to an
             # unscoped session that can never be signed in.
             channel_worker_target = context.resolve_worker_target()
             if channel_worker_target.worker_scope is not None:
@@ -722,48 +710,23 @@ class DeepResearchTools(Toolkit):
             LOGGER.warning("deep_research_website_unavailable", error=str(exc))
             return _error(f"Website reader is unavailable: {exc}")
 
-        counters = {"reason": 0, "extract": 0, "synthesize": 0, "ground": 0}
         wrapper_start = time.monotonic()
 
         def remaining_wall_clock_seconds() -> float:
             return max(0.0, wall_clock_seconds - (time.monotonic() - wrapper_start))
 
         async def reason_fn(prompt: str) -> object:
-            counters["reason"] += 1
-            return await _ask_model(
-                live_model,
-                prompt,
-                schema=ResearchStep,
-                session_id=_session_id(context, "reason", counters["reason"]),
-            )
+            return await _ask_model(live_model, prompt, schema=ResearchStep)
 
         async def extract_fn(prompt: str) -> object:
-            counters["extract"] += 1
-            return await _ask_model(
-                extract_live_model,
-                prompt,
-                schema=Extraction,
-                session_id=_session_id(context, "extract", counters["extract"]),
-            )
+            return await _ask_model(extract_live_model, prompt, schema=Extraction)
 
         async def synthesize_fn(prompt: str) -> str:
-            counters["synthesize"] += 1
-            content = await _ask_model(
-                live_model,
-                prompt,
-                schema=None,
-                session_id=_session_id(context, "synthesize", counters["synthesize"]),
-            )
+            content = await _ask_model(live_model, prompt, schema=None)
             return content if isinstance(content, str) else str(content)
 
         async def ground_fn(prompt: str) -> object:
-            counters["ground"] += 1
-            return await _ask_model(
-                ground_live_model,
-                prompt,
-                schema=GroundingCheck,
-                session_id=_session_id(context, "ground", counters["ground"]),
-            )
+            return await _ask_model(ground_live_model, prompt, schema=GroundingCheck)
 
         async def search_fn(query: SearchQuery, limit: int) -> list[SearchHit]:
             channel = channels.get(query.kind)
@@ -855,26 +818,9 @@ class DeepResearchTools(Toolkit):
         )
 
 
-def _load_model(
-    config: Any,
-    runtime_paths: Any,
-    model_name: str,
-    *,
-    execution_identity: Any,
-) -> Any:
-    """Return the configured model: an owned provider, or an Agno model on earlier MindRoom releases."""
-    if build_model_provider is not None:
-        return build_model_provider(config, runtime_paths, model_name, execution_identity=execution_identity)
-    return get_model_instance(config, runtime_paths, model_name, execution_identity=execution_identity)
-
-
-async def _ask_model(model: Any, prompt: str, *, schema: type[BaseModel] | None, session_id: str) -> object:
+async def _ask_model(model: ModelProvider, prompt: str, *, schema: type[BaseModel] | None) -> object:
     """Send one prompt to ``model`` and return its content, parsed into ``schema`` when it parses."""
-    if complete_prompt is not None:
-        response = await complete_prompt(model, prompt, schema=schema)
-        return response.content
-    agent = Agent(model=model, output_schema=schema, telemetry=False, markdown=False)
-    response = await agent.arun(prompt, session_id=session_id)
+    response = await complete_prompt(model, prompt, schema=schema)
     return response.content
 
 

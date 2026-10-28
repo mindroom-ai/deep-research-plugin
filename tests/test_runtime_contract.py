@@ -4,7 +4,7 @@
 The plugin uses direct, typed access to MindRoom and agno APIs — no
 defensive probing. These assertions turn runtime version skew into a red
 test at vendor-bump time instead of silently degraded behavior at dispatch
-time. Minimum runtime: MindRoom v2026.10.243.
+time.
 """
 
 from __future__ import annotations
@@ -16,15 +16,11 @@ from agno.tools.serper import SerperTools
 from mindroom.config.entity_view import ResolvedEntityView
 from mindroom.config.main import Config
 from mindroom.tool_system.runtime_context import ToolRuntimeContext
-
-try:  # MindRoom's own tool values
-    from mindroom.tool_system.tool_function import ToolValue
-except ImportError:  # earlier MindRoom releases, whose tools return agno ToolResults
-    ToolValue = None
+from mindroom.tool_system.tool_function import ToolValue
 
 
 def test_runtime_provides_typed_worker_target_api() -> None:
-    """MindRoom >= v2026.7.99: worker-target resolution and public scope accessor."""
+    """MindRoom: worker-target resolution and public scope accessor."""
     assert callable(ToolRuntimeContext.resolve_worker_target)
     assert callable(Config.resolve_entity)
     assert isinstance(ResolvedEntityView.execution_scope, property)
@@ -38,6 +34,5 @@ def test_toolkit_and_result_contracts() -> None:
     assert isinstance(toolkit.functions, dict)
     assert isinstance(toolkit.async_functions, dict)
     assert ToolResult(content="x").content == "x"
-    if ToolValue is not None:
-        assert ToolValue(content="x").content == "x"
+    assert ToolValue(content="x").content == "x"
     assert SerperTools(api_key="k").api_key == "k"

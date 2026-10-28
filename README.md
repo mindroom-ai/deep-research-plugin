@@ -186,10 +186,6 @@ agents:
 
   Plain YAML mappings remain supported wherever config reaches the tool unconverted (global tool config, direct construction).
 
-## Requirements
-
-MindRoom **v2026.10.243 or newer**: the plugin imports model loading from `mindroom.providers`, uses the split tool declaration/registration API, and resolves search-channel toolkits through the typed `ToolRuntimeContext.resolve_worker_target()` API so OAuth-backed MCP channels use the requester's own connection. There is deliberately no fallback for older runtimes — channel resolution fails with a clear error instead of degrading to an unscoped session that can never be signed in.
-
 ## Install
 
 Vendor this plugin with the MindRoom CLI:
