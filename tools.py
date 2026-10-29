@@ -675,6 +675,7 @@ class DeepResearchTools(Toolkit):
                     tool_config_overrides=_authored_tool_overrides(context, channel_config.tool) or None,
                     allowed_shared_services=channel_shared_services,
                     worker_target=channel_worker_target,
+                    runtime_config=context.config,
                 )
                 _tool_function_entrypoint(channel_toolkit, channel_config.function)
             except Exception as exc:
