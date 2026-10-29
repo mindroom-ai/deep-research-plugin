@@ -166,7 +166,7 @@ agents:
         limit: "{num_results}"
   ```
 
-  MCP-style result objects are unwrapped (`.content`) before parsing, and functions registered in a toolkit's `async_functions` (as MCP toolkits do) are found alongside plain `functions`.
+  MCP-style result objects are unwrapped (`.content`) before parsing, and a channel function may be async, as MCP tools are.
 - Internal URLs that the native website reader cannot fetch degrade to their search snippet as unvetted sources, and the reasoner can cite snippet-backed channel hits directly via `cite_snippet_urls` — so channels remain useful even when their pages are not readable.
 - UIs that only accept strings can use the compact form `"wiki=my_wiki_tool.search_documents|Internal documentation"`.
 - **Per-agent overrides must use JSON object strings**: MindRoom validates per-agent `string[]` overrides as lists of strings (and hands them to the tool comma-joined), so structured channels on an agent's tool entry are authored as JSON strings of the same shape:

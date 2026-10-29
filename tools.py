@@ -8,7 +8,7 @@ import inspect
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -17,30 +17,28 @@ from agno.tools.function import ToolResult
 from agno.tools.serper import SerperTools
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
-from mindroom.agent_loop.helper import complete_prompt
-from mindroom.logging_config import get_logger
-from mindroom.providers.registry import build_model_provider
-from mindroom.tool_system.declarations import (
+from mindroom.plugin_api import (
     ConfigField,
     SetupType,
     ToolCategory,
     ToolFileAccess,
     ToolStatus,
-)
-from mindroom.tool_system.metadata import get_tool_by_name
-from mindroom.tool_system.registration import register_tool_with_metadata
-from mindroom.tool_system.runtime_context import (
+    ToolValue,
     build_execution_identity_from_runtime_context,
+    build_model_provider,
+    complete_prompt,
+    get_logger,
+    get_tool_by_name,
     get_tool_runtime_context,
+    register_tool_with_metadata,
     resolve_tool_runtime_hook_bindings,
+    toolkit_functions,
 )
-from mindroom.tool_system.tool_function import ToolValue
 from mindroom.turn_model import ModelScope, resolve_turn_model
 
 if TYPE_CHECKING:
     from mindroom.llm.provider import ModelProvider
-    from mindroom.tool_system.runtime_context import ToolRuntimeContext
-    from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
+    from mindroom.plugin_api import ResolvedWorkerTarget, ToolRuntimeContext
 
 from .prompts import BASE_CHANNEL_DESCRIPTIONS
 from .loop import (
@@ -186,10 +184,9 @@ def _parse_search_channels(raw: object) -> list[_ChannelConfig]:
 
 @dataclass(frozen=True)
 class _ResolvedChannel:
-    """One search channel bound to its resolved toolkit for a single run."""
+    """One search channel bound to its resolved toolkit function for a single run."""
 
-    toolkit: Toolkit
-    function: str
+    search: Callable[..., object]
     description: str
     arguments: dict[str, object] | None
 
@@ -340,17 +337,21 @@ def _parse_search_results(raw: str) -> list[SearchHit]:
     return hits
 
 
-def _tool_function_entrypoint(toolkit: Toolkit, function_name: str) -> Callable[..., object]:
-    # MCP-backed toolkits register their functions in async_functions.
-    function = toolkit.functions.get(function_name) or toolkit.async_functions.get(function_name)
-    if function is None or function.entrypoint is None:
+def _tool_function(functions: Mapping[str, Callable[..., object]], function_name: str) -> Callable[..., object]:
+    function = functions.get(function_name)
+    if function is None:
         msg = f"Tool function is unavailable: {function_name}"
         raise RuntimeError(msg)
-    return function.entrypoint
+    return function
 
 
-async def _call_tool_function(toolkit: Toolkit, function_name: str, *args: object, **kwargs: object) -> str:
-    raw = await asyncio.to_thread(_tool_function_entrypoint(toolkit, function_name), *args, **kwargs)
+async def _call_tool_function(function: Callable[..., object], *args: object, **kwargs: object) -> str:
+    if inspect.iscoroutinefunction(function):
+        raw = await function(*args, **kwargs)
+    else:
+        raw = await asyncio.to_thread(function, *args, **kwargs)
+        if inspect.isawaitable(raw):
+            raw = await raw
     return _result_text(raw)
 
 
@@ -390,30 +391,19 @@ def _substitute_placeholders(value: object, *, query: str, num_results: int) -> 
 
 
 async def _call_search_function(
-    toolkit: object,
-    function_name: str,
+    search: Callable[..., object],
     query: str,
     *,
     num_results: int,
     arguments: dict[str, object] | None = None,
 ) -> str:
-    entrypoint = _tool_function_entrypoint(toolkit, function_name)
     if arguments is not None:
         # Keyword-shaped call for functions that take structured kwargs
         # (e.g. MCP tools); the template carries the query placement.
-        args: tuple[object, ...] = ()
         substituted = _substitute_placeholders(arguments, query=query, num_results=num_results)
-        kwargs = substituted if isinstance(substituted, dict) else {}
-    else:
-        args = (query,)
-        kwargs = {"num_results": num_results} if _accepts_keyword(entrypoint, "num_results") else {}
-    if inspect.iscoroutinefunction(entrypoint):
-        raw = await entrypoint(*args, **kwargs)
-    else:
-        raw = await asyncio.to_thread(entrypoint, *args, **kwargs)
-        if inspect.isawaitable(raw):
-            raw = await raw
-    return _result_text(raw)
+        return await _call_tool_function(search, **(substituted if isinstance(substituted, dict) else {}))
+    kwargs = {"num_results": num_results} if _accepts_keyword(search, "num_results") else {}
+    return await _call_tool_function(search, query, **kwargs)
 
 
 def _result_text(raw: object) -> str:
@@ -643,17 +633,16 @@ class DeepResearchTools(Toolkit):
         # search is dropped with a warning, like an extra channel below.
         channel_warnings: list[str] = []
         wanted_functions = {"web": self.search_function} if self.search_function else SERPER_SEARCH_FUNCTIONS
-        search_functions: dict[str, str] = {}
+        search_toolkit_functions = toolkit_functions(search_toolkit)
+        search_functions: dict[str, Callable[..., object]] = {}
         for kind, function_name in wanted_functions.items():
             try:
-                _tool_function_entrypoint(search_toolkit, function_name)
+                search_functions[kind] = _tool_function(search_toolkit_functions, function_name)
             except RuntimeError as exc:
                 if kind == "web":
                     return _error(f"Search tool '{search_tool_name}' cannot search the web: {exc}")
                 LOGGER.warning("deep_research_search_kind_unavailable", kind=kind, error=str(exc))
                 channel_warnings.append(f"search kind '{kind}' unavailable: {exc}")
-                continue
-            search_functions[kind] = function_name
 
         # Extra search channels degrade gracefully: an unavailable channel is
         # dropped (and reported in warnings) instead of failing the run, and
@@ -677,7 +666,7 @@ class DeepResearchTools(Toolkit):
                     worker_target=channel_worker_target,
                     runtime_config=context.config,
                 )
-                _tool_function_entrypoint(channel_toolkit, channel_config.function)
+                channel_search = _tool_function(toolkit_functions(channel_toolkit), channel_config.function)
             except Exception as exc:
                 LOGGER.warning(
                     "deep_research_search_channel_unavailable",
@@ -688,8 +677,7 @@ class DeepResearchTools(Toolkit):
                 channel_warnings.append(f"search channel '{channel_config.name}' unavailable: {exc}")
                 continue
             channels[channel_config.name] = _ResolvedChannel(
-                toolkit=channel_toolkit,
-                function=channel_config.function,
+                search=channel_search,
                 description=channel_config.description,
                 arguments=channel_config.arguments,
             )
@@ -698,11 +686,8 @@ class DeepResearchTools(Toolkit):
         prompt_channels.extend((name, channel.description) for name, channel in channels.items())
 
         try:
-            website = get_tool_by_name(
-                "website",
-                context.runtime_paths,
-                worker_target=None,
-            )
+            website = get_tool_by_name("website", context.runtime_paths, worker_target=None)
+            read_url = _tool_function(toolkit_functions(website), "read_url")
         except Exception as exc:
             LOGGER.warning("deep_research_website_unavailable", error=str(exc))
             return _error(f"Website reader is unavailable: {exc}")
@@ -729,19 +714,18 @@ class DeepResearchTools(Toolkit):
             channel = channels.get(query.kind)
             if channel is not None:
                 raw = await _call_search_function(
-                    channel.toolkit,
-                    channel.function,
+                    channel.search,
                     query.query,
                     num_results=limit,
                     arguments=channel.arguments,
                 )
             else:
-                search_method = search_functions.get(query.kind, search_functions["web"])
-                raw = await _call_search_function(search_toolkit, search_method, query.query, num_results=limit)
+                search = search_functions.get(query.kind, search_functions["web"])
+                raw = await _call_search_function(search, query.query, num_results=limit)
             return _parse_search_results(raw)
 
         async def read_fn(url: str) -> Page:
-            title, text = _extract_text_from_website_payload(await _call_tool_function(website, "read_url", url))
+            title, text = _extract_text_from_website_payload(await _call_tool_function(read_url, url))
             return Page(url=url, title=title or url, text=_truncate(text, page_char_limit))
 
         async def emit_fn(event: dict[str, object]) -> None:

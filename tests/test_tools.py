@@ -18,6 +18,7 @@ from uuid import uuid4
 
 import pytest
 
+from agno.tools import Toolkit as AgnoToolkit
 from agno.tools.function import ToolResult
 from agno.tools.serper import SerperTools
 
@@ -26,6 +27,7 @@ from mindroom.config.main import Config, load_config
 from mindroom.config.models import DefaultsConfig
 from mindroom.constants import resolve_primary_runtime_paths
 from mindroom.message_target import MessageTarget
+from mindroom.plugin_api import Toolkit, tool, toolkit_functions
 from mindroom.tool_system.declarations import SetupType, ToolStatus
 from mindroom.tool_system.metadata import get_tool_by_name as resolve_tool_by_name
 from mindroom.tool_system.plugins import load_plugins
@@ -94,17 +96,16 @@ def _tool_context(
     )
 
 
-def _register_functions(toolkit: Any, *names: str) -> Any:
-    toolkit.functions = {name: SimpleNamespace(entrypoint=getattr(toolkit, name)) for name in names}
-    toolkit.async_functions = {}
-    return toolkit
+class _FakeSerper(AgnoToolkit):
+    """A vendor toolkit, as Agno's Serper is; a subclass's overrides are its functions."""
 
-
-class _FakeSerper:
     api_key = "key"
 
     def __init__(self) -> None:
-        _register_functions(self, "search_web", "search_news", "search_scholar", "scrape_webpage")
+        super().__init__(
+            name="serper",
+            tools=[self.search_web, self.search_news, self.search_scholar, self.scrape_webpage],
+        )
 
     def search_web(self, _query: str, num_results: int | None = None) -> str:
         return json.dumps({"organic": []})
@@ -119,10 +120,10 @@ class _FakeSerper:
         return json.dumps({"text": "fallback text"})
 
 
-class _FakeWebsite:
-    def __init__(self) -> None:
-        _register_functions(self, "read_url")
+class _FakeWebsite(Toolkit):
+    """An owned toolkit, as MindRoom's website reader is."""
 
+    @tool
     def read_url(self, _url: str) -> str:
         return json.dumps([{"content": "website text long enough" * 40, "meta_data": {"title": "Title"}}])
 
@@ -133,10 +134,6 @@ def _tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
     if name == "website":
         return _FakeWebsite()
     raise AssertionError(name)
-
-
-def _entrypoint(entrypoint: Any) -> SimpleNamespace:
-    return SimpleNamespace(entrypoint=entrypoint)
 
 
 def _result(module: ModuleType, *, rounds_used: int = 1) -> Any:
@@ -173,8 +170,8 @@ def test_plugin_discovery_registers_tool_and_builtin_dependencies_resolve(tmp_pa
                 runtime_paths,
                 worker_target=None,
             )
-            resolve_tool_by_name("serper", runtime_paths, worker_target=None)
-            resolve_tool_by_name("website", runtime_paths, worker_target=None)
+            serper = resolve_tool_by_name("serper", runtime_paths, worker_target=None)
+            website = resolve_tool_by_name("website", runtime_paths, worker_target=None)
             deep_research_metadata = TOOL_METADATA["deep_research"]
     finally:
         restore_tool_registry_snapshot(snapshot)
@@ -186,6 +183,8 @@ def test_plugin_discovery_registers_tool_and_builtin_dependencies_resolve(tmp_pa
     checked_dependency_sets = {tuple(call.args[0]) for call in ensure_deps.call_args_list}
     assert ("requests",) in checked_dependency_sets
     assert ("httpx", "beautifulsoup4") in checked_dependency_sets
+    assert {"search_web", "search_news", "search_scholar"} <= set(toolkit_functions(serper))
+    assert "read_url" in toolkit_functions(website)
 
 
 @pytest.mark.asyncio
@@ -580,10 +579,8 @@ async def test_depth_args_are_forwarded_to_loop_and_page_reader() -> None:
         assert len(page.text) == 120_000
         return _result(module)
 
-    class LongWebsite:
-        def __init__(self) -> None:
-            _register_functions(self, "read_url")
-
+    class LongWebsite(Toolkit):
+        @tool
         def read_url(self, _url: str) -> str:
             return json.dumps([{"content": "x" * 200_000, "meta_data": {"title": "Long"}}])
 
@@ -668,30 +665,26 @@ async def test_malformed_numeric_args_return_error_envelope(kwargs: dict[str, ob
 
 
 @pytest.mark.asyncio
-async def test_tool_function_entrypoints_are_used_for_search_and_read() -> None:
+async def test_search_and_read_call_the_toolkits_functions_not_its_same_named_methods() -> None:
     module = _load_tools_module()
     tools = module.DeepResearchTools()
 
-    class EntrypointSerper(_FakeSerper):
-        def __init__(self) -> None:
-            self.functions = {"search_web": _entrypoint(self.entrypoint_search_web)}
-            self.async_functions = {}
-
+    class EntrypointSerper(Toolkit):
+        @tool(name="search_web")
         def entrypoint_search_web(self, query: str, num_results: int | None = None) -> str:
             return json.dumps({"organic": [{"link": "https://example.com", "title": query, "snippet": str(num_results)}]})
 
         def search_web(self, _query: str, num_results: int | None = None) -> str:
-            raise AssertionError("direct search method bypassed toolkit function entrypoint")
+            raise AssertionError("direct search method bypassed the toolkit's function")
 
-    class EntrypointWebsite(_FakeWebsite):
-        def __init__(self) -> None:
-            self.functions = {"read_url": _entrypoint(self.entrypoint_read_url)}
-
-        def entrypoint_read_url(self, url: str) -> str:
+    class EntrypointWebsite(Toolkit):
+        # Async, as a function routed to a worker is.
+        @tool(name="read_url")
+        async def entrypoint_read_url(self, url: str) -> str:
             return json.dumps([{"content": f"entrypoint text for {url}", "meta_data": {"title": "Entrypoint"}}])
 
         def read_url(self, _url: str) -> str:
-            raise AssertionError("direct read method bypassed toolkit function entrypoint")
+            raise AssertionError("direct read method bypassed the toolkit's function")
 
     def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
         if name == "serper":
@@ -765,10 +758,8 @@ async def test_website_error_payload_returns_read_warning() -> None:
     module = _load_tools_module()
     tools = module.DeepResearchTools()
 
-    class ErrorWebsite:
-        def __init__(self) -> None:
-            _register_functions(self, "read_url")
-
+    class ErrorWebsite(Toolkit):
+        @tool
         def read_url(self, _url: str) -> str:
             return json.dumps({"status": "error", "message": "fetch failed"})
 
@@ -836,10 +827,8 @@ async def test_read_boundary_uses_native_website_hardening_without_serper_fallba
         def scrape_webpage(self, scrape_url: str) -> str:
             return scrape_webpage(scrape_url)
 
-    class HardenedWebsite:
-        def __init__(self) -> None:
-            _register_functions(self, "read_url")
-
+    class HardenedWebsite(Toolkit):
+        @tool
         def read_url(self, read_url: str) -> str:
             assert read_url == url
             raise RuntimeError(f"blocked by native website hardening: {reason}")
@@ -908,10 +897,8 @@ async def test_custom_search_backend_serves_all_query_kinds() -> None:
     tools = module.DeepResearchTools(search_tool="grounded_search", search_function="search_public_web")
     queries: list[str] = []
 
-    class GroundedSearch:
-        def __init__(self) -> None:
-            _register_functions(self, "search_public_web")
-
+    class GroundedSearch(Toolkit):
+        @tool
         def search_public_web(self, query: str) -> str:
             queries.append(query)
             return json.dumps(
@@ -956,10 +943,8 @@ async def test_custom_async_search_function_is_awaited() -> None:
     module = _load_tools_module()
     tools = module.DeepResearchTools(search_tool="grounded_search", search_function="search_public_web")
 
-    class AsyncGroundedSearch:
-        def __init__(self) -> None:
-            _register_functions(self, "search_public_web")
-
+    class AsyncGroundedSearch(Toolkit):
+        @tool
         async def search_public_web(self, query: str) -> str:
             return json.dumps({"sources": [{"uri": "https://example.com/async", "title": query}]})
 
@@ -998,10 +983,8 @@ async def test_search_tool_resolution_uses_calling_agents_authored_overrides() -
     ]
     calls: list[tuple[str, Any]] = []
 
-    class GroundedSearch:
-        def __init__(self) -> None:
-            _register_functions(self, "search_public_web")
-
+    class GroundedSearch(Toolkit):
+        @tool
         def search_public_web(self, _query: str) -> str:
             return json.dumps({"sources": []})
 
@@ -1079,14 +1062,13 @@ def test_search_toolkit_keeps_the_searches_an_agent_hid_from_itself() -> None:
 
     toolkit = SerperTools(api_key="key", **module._authored_tool_overrides(context, "serper"))
 
-    assert {"search_web", "search_news", "search_scholar"} <= set(toolkit.functions)
+    assert {"search_web", "search_news", "search_scholar"} <= set(toolkit_functions(toolkit))
     assert toolkit.num_results == 7
 
 
-def _serper_with(*names: str) -> Any:
+def _serper_with(*names: str) -> Toolkit:
     serper = _FakeSerper()
-    serper.functions = {name: function for name, function in serper.functions.items() if name in names}
-    return serper
+    return Toolkit(name="serper", tools=[getattr(serper, name) for name in names])
 
 
 @pytest.mark.asyncio
@@ -1121,9 +1103,13 @@ async def test_a_search_kind_the_tool_lacks_is_dropped_and_falls_back_to_web() -
     module = _load_tools_module()
     tools = module.DeepResearchTools()
     loop = AsyncMock(return_value=_result(module))
-    serper = _serper_with("search_web", "search_scholar")
-    serper.search_web = Mock(return_value=json.dumps({"organic": []}))
-    serper.functions["search_web"] = _entrypoint(serper.search_web)
+    web_searches: list[str] = []
+
+    def search_web(query: str, num_results: int | None = None) -> str:
+        web_searches.append(query)
+        return json.dumps({"organic": []})
+
+    serper = Toolkit(name="serper", tools=[search_web, _FakeSerper().search_scholar])
 
     def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
         if name == "serper":
@@ -1146,7 +1132,7 @@ async def test_a_search_kind_the_tool_lacks_is_dropped_and_falls_back_to_web() -
     assert result["status"] == "ok"
     assert [name for name, _description in loop.await_args.kwargs["search_channels"]] == ["web", "scholar"]
     assert any("news" in warning and "search_news" in warning for warning in result["warnings"])
-    serper.search_web.assert_called_once()
+    assert web_searches == ["latest"]
 
 
 @pytest.mark.asyncio
@@ -1314,18 +1300,14 @@ async def test_search_channels_route_by_kind_and_advertise_to_reasoner() -> None
     channel_queries: list[str] = []
     web_queries: list[str] = []
 
-    class GroundedSearch:
-        def __init__(self) -> None:
-            _register_functions(self, "search_public_web")
-
+    class GroundedSearch(Toolkit):
+        @tool
         def search_public_web(self, query: str) -> str:
             web_queries.append(query)
             return json.dumps({"sources": [{"uri": "https://web.example/a", "title": "W"}]})
 
-    class WikiTool:
-        def __init__(self) -> None:
-            _register_functions(self, "search_documents")
-
+    class WikiTool(Toolkit):
+        @tool
         def search_documents(self, query: str) -> str:
             channel_queries.append(query)
             return json.dumps([{"url": "https://wiki.example/doc/1", "title": "Doc", "context": "wiki fact"}])
@@ -1375,10 +1357,8 @@ async def test_unavailable_search_channel_degrades_with_warning() -> None:
         search_channels=["wiki=missing_tool.search|Internal wiki"],
     )
 
-    class GroundedSearch:
-        def __init__(self) -> None:
-            _register_functions(self, "search_public_web")
-
+    class GroundedSearch(Toolkit):
+        @tool
         def search_public_web(self, _query: str) -> str:
             return json.dumps({"sources": []})
 
@@ -1422,17 +1402,13 @@ async def test_search_channel_tools_resolve_with_agent_authored_overrides() -> N
     ]
     calls: list[tuple[str, Any]] = []
 
-    class GroundedSearch:
-        def __init__(self) -> None:
-            _register_functions(self, "search_public_web")
-
+    class GroundedSearch(Toolkit):
+        @tool
         def search_public_web(self, _query: str) -> str:
             return json.dumps({"sources": []})
 
-    class WikiTool:
-        def __init__(self) -> None:
-            _register_functions(self, "search_documents")
-
+    class WikiTool(Toolkit):
+        @tool
         def search_documents(self, _query: str) -> str:
             return json.dumps([])
 
@@ -1530,7 +1506,7 @@ def test_parse_search_channels_rejects_non_dict_arguments() -> None:
 
 
 @pytest.mark.asyncio
-async def test_mcp_bridge_channel_uses_arguments_template_async_functions_and_content_unwrap() -> None:
+async def test_mcp_bridge_channel_uses_arguments_template_awaits_a_vendor_async_function_and_unwraps_content() -> None:
     module = _load_tools_module()
     tools = module.DeepResearchTools(
         search_tool="grounded_search",
@@ -1550,24 +1526,16 @@ async def test_mcp_bridge_channel_uses_arguments_template_async_functions_and_co
     )
     bridge_calls: list[dict[str, Any]] = []
 
-    class McpWiki:
-        def __init__(self) -> None:
-            async def bridge(*, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
-                bridge_calls.append({"tool_name": tool_name, "arguments": arguments})
-                return ToolResult(
-                    content=json.dumps(
-                        {"documents": [{"url": "https://wiki.example/doc/1", "title": "Doc", "context": "wiki fact"}]},
-                    ),
-                )
+    async def wiki_call_tool(*, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
+        bridge_calls.append({"tool_name": tool_name, "arguments": arguments})
+        return ToolResult(
+            content=json.dumps(
+                {"documents": [{"url": "https://wiki.example/doc/1", "title": "Doc", "context": "wiki fact"}]},
+            ),
+        )
 
-            # MCP toolkits register functions in async_functions, not functions.
-            self.functions: dict[str, Any] = {}
-            self.async_functions = {"wiki_call_tool": _entrypoint(bridge)}
-
-    class GroundedSearch:
-        def __init__(self) -> None:
-            _register_functions(self, "search_public_web")
-
+    class GroundedSearch(Toolkit):
+        @tool
         def search_public_web(self, _query: str) -> str:
             return json.dumps({"sources": []})
 
@@ -1575,7 +1543,7 @@ async def test_mcp_bridge_channel_uses_arguments_template_async_functions_and_co
         if name == "grounded_search":
             return GroundedSearch()
         if name == "mcp_wiki":
-            return McpWiki()
+            return AgnoToolkit(name="mcp_wiki", tools=[wiki_call_tool])
         if name == "website":
             return _FakeWebsite()
         raise AssertionError(name)
@@ -1767,21 +1735,16 @@ async def test_channel_toolkits_resolve_with_callers_worker_target_and_config() 
     context.config.get_worker_grantable_credentials = lambda: frozenset({"google_vertex_adc"})
     calls: list[tuple[str, Any, Any, Any]] = []
 
-    class GroundedSearch:
-        def __init__(self) -> None:
-            _register_functions(self, "search_public_web")
-
+    class GroundedSearch(Toolkit):
+        @tool
         def search_public_web(self, _query: str) -> str:
             return json.dumps({"sources": []})
 
-    class McpWiki:
-        def __init__(self) -> None:
-            async def bridge(*, tool_name: str, arguments: dict[str, Any]) -> str:
-                del tool_name, arguments
-                return json.dumps({"documents": []})
-
-            self.functions: dict[str, Any] = {}
-            self.async_functions = {"wiki_call_tool": _entrypoint(bridge)}
+    class McpWiki(Toolkit):
+        @tool
+        async def wiki_call_tool(self, *, tool_name: str, arguments: dict[str, Any]) -> str:
+            del tool_name, arguments
+            return json.dumps({"documents": []})
 
     def tool_by_name(name: str, *_args: Any, **kwargs: Any) -> Any:
         calls.append(
@@ -1828,10 +1791,8 @@ async def test_worker_target_resolution_failure_is_loud() -> None:
         msg = "resolve_worker_target requires an agent dispatch"
         raise ValueError(msg)
 
-    class GroundedSearch:
-        def __init__(self) -> None:
-            _register_functions(self, "search_public_web")
-
+    class GroundedSearch(Toolkit):
+        @tool
         def search_public_web(self, _query: str) -> str:
             return json.dumps({"sources": []})
 

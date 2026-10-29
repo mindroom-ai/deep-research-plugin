@@ -9,13 +9,12 @@ time.
 
 from __future__ import annotations
 
-from agno.tools import Toolkit
+from agno.tools import Toolkit as AgnoToolkit
 from agno.tools.function import ToolResult
 from agno.tools.serper import SerperTools
 
 from mindroom.config.main import Config
-from mindroom.tool_system.runtime_context import ToolRuntimeContext
-from mindroom.tool_system.tool_function import ToolValue
+from mindroom.plugin_api import Toolkit, ToolRuntimeContext, ToolValue, toolkit_functions
 from mindroom.turn_model import ModelScope, resolve_turn_model
 
 
@@ -29,10 +28,13 @@ def test_runtime_provides_typed_worker_target_api() -> None:
 
 
 def test_toolkit_and_result_contracts() -> None:
-    """agno: function registries are dicts; ToolResult and MindRoom's ToolValue carry string content."""
-    toolkit = Toolkit(name="contract-check")
-    assert isinstance(toolkit.functions, dict)
-    assert isinstance(toolkit.async_functions, dict)
+    """MindRoom's toolkit_functions calls owned and Agno toolkits; ToolResult and ToolValue carry string content."""
+
+    def search(query: str) -> str:
+        return query
+
+    assert toolkit_functions(Toolkit(name="contract-check", tools=[search]))["search"]("x") == "x"
+    assert toolkit_functions(AgnoToolkit(name="contract-check", tools=[search]))["search"]("x") == "x"
     assert ToolResult(content="x").content == "x"
     assert ToolValue(content="x").content == "x"
     assert SerperTools(api_key="k").api_key == "k"
