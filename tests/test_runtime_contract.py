@@ -13,16 +13,16 @@ from agno.tools import Toolkit as AgnoToolkit
 from agno.tools.function import ToolResult
 from agno.tools.serper import SerperTools
 
-from mindroom.config.entity_view import ResolvedEntityView
 from mindroom.config.main import Config
 from mindroom.plugin_api import Toolkit, ToolRuntimeContext, ToolValue, toolkit_functions
+from mindroom.turn_model import ModelScope, resolve_turn_model
 
 
 def test_runtime_provides_typed_worker_target_api() -> None:
-    """MindRoom: worker-target resolution and public scope accessor."""
+    """MindRoom: worker-target resolution, turn model resolution, and agent lookup."""
     assert callable(ToolRuntimeContext.resolve_worker_target)
-    assert callable(Config.resolve_entity)
-    assert isinstance(ResolvedEntityView.execution_scope, property)
+    assert callable(resolve_turn_model)
+    assert ModelScope(entity="code").entity == "code"
     assert callable(Config.get_agent)
     assert callable(Config.get_worker_grantable_credentials)
 

@@ -34,6 +34,7 @@ from mindroom.plugin_api import (
     resolve_tool_runtime_hook_bindings,
     toolkit_functions,
 )
+from mindroom.turn_model import ModelScope, resolve_turn_model
 
 if TYPE_CHECKING:
     from mindroom.llm.provider import ModelProvider
@@ -106,12 +107,12 @@ class _ChannelConfig(BaseModel):
 def _coerce_channel_entries(raw: object) -> list[object]:
     """Expand raw channel config into a list of entry objects.
 
-    MindRoom validates per-agent string[] overrides as lists of strings and
-    hands them to the constructor comma-joined into ONE string, so channels
+    MindRoom validates string[] settings as lists of strings, so channels
     with structured fields (arguments templates) must be authored as JSON
-    object strings. Wrapping the joined form in brackets re-parses it as a
-    JSON array regardless of commas inside quoted values; individual JSON
-    object strings inside lists are decoded the same way.
+    object strings; each JSON object string in the list is decoded. A single
+    string, such as a comma-joined list, is also accepted: wrapping it in
+    brackets re-parses it as a JSON array regardless of commas inside
+    quoted values.
     """
     if isinstance(raw, str):
         text = raw.strip()
@@ -229,13 +230,8 @@ def _resolve_model_name(context: ToolRuntimeContext, model: str | None) -> str:
         return model
     if context.active_model_name:
         return context.active_model_name
-    resolved = context.config.resolve_runtime_model(
-        entity_name=context.agent_name,
-        room_id=context.room_id,
-        thread_id=context.resolved_thread_id,
-        runtime_paths=context.runtime_paths,
-    )
-    return resolved.model_name
+    scope = ModelScope(entity=context.agent_name, room_id=context.room_id, thread_id=context.resolved_thread_id)
+    return resolve_turn_model(context.config, context.runtime_paths, scope, None).model_name
 
 
 def _extract_text_from_website_payload(payload: str) -> tuple[str, str]:
@@ -668,6 +664,7 @@ class DeepResearchTools(Toolkit):
                     tool_config_overrides=_authored_tool_overrides(context, channel_config.tool) or None,
                     allowed_shared_services=channel_shared_services,
                     worker_target=channel_worker_target,
+                    runtime_config=context.config,
                 )
                 channel_search = _tool_function(toolkit_functions(channel_toolkit), channel_config.function)
             except Exception as exc:
