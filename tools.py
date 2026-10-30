@@ -19,6 +19,7 @@ from pydantic import BaseModel, ValidationError, field_validator, model_validato
 
 from mindroom.plugin_api import (
     ConfigField,
+    ModelScope,
     SetupType,
     ToolCategory,
     ToolFileAccess,
@@ -30,13 +31,12 @@ from mindroom.plugin_api import (
     get_tool_by_name,
     get_tool_runtime_context,
     register_tool_with_metadata,
+    resolve_turn_model,
     toolkit_functions,
 )
-from mindroom.turn_model import ModelScope, resolve_turn_model
 
 if TYPE_CHECKING:
-    from mindroom.llm.provider import ModelProvider
-    from mindroom.plugin_api import ResolvedWorkerTarget, ToolRuntimeContext
+    from mindroom.plugin_api import ModelProvider, ResolvedWorkerTarget, ToolRuntimeContext
 
 from .prompts import BASE_CHANNEL_DESCRIPTIONS
 from .loop import (
