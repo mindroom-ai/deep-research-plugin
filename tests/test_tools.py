@@ -27,15 +27,11 @@ from mindroom.config.main import Config, load_config
 from mindroom.config.models import DefaultsConfig
 from mindroom.constants import resolve_primary_runtime_paths
 from mindroom.message_target import MessageTarget
-from mindroom.plugin_api import Toolkit, tool, toolkit_functions
+from mindroom.plugin_api import HookBindings, Toolkit, tool, toolkit_functions
 from mindroom.tool_system.declarations import SetupType, ToolStatus
 from mindroom.tool_system.metadata import get_tool_by_name as resolve_tool_by_name
-from mindroom.tool_system.plugins import load_plugins
-from mindroom.tool_system.registry_state import (
-    TOOL_METADATA,
-    capture_tool_registry_snapshot,
-    restore_tool_registry_snapshot,
-)
+from mindroom.tool_system.plugins import PluginGeneration, config_plugins, prepare_plugins, publish_plugins
+from mindroom.tool_system.registry import plugin_module_registrations
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
 
 if TYPE_CHECKING:
@@ -53,7 +49,9 @@ def _load_tools_module() -> ModuleType:
     assert spec.loader is not None
     module = util.module_from_spec(spec)
     sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    # A plugin module registers its tools while it loads, as the plugin loader runs it.
+    with plugin_module_registrations(module_name):
+        spec.loader.exec_module(module)
     return module
 
 
@@ -88,10 +86,11 @@ def _tool_context(
         client=AsyncMock(),
         config=config,
         runtime_paths=SimpleNamespace(env_value=lambda _name: None),
+        plugins=SimpleNamespace(tools=object()),
         conversation_reader=AsyncMock(),
         relations=AsyncMock(),
         active_model_name=active_model_name,
-        hook_message_sender=sender,
+        hooks=HookBindings(message_sender=sender),
         correlation_id="corr-1",
     )
 
@@ -158,25 +157,31 @@ async def _await(value: Any) -> Any:
 
 
 def test_plugin_discovery_registers_tool_and_builtin_dependencies_resolve(tmp_path: Path) -> None:
-    snapshot = capture_tool_registry_snapshot()
     runtime_paths = resolve_primary_runtime_paths(config_path=tmp_path / "config.yaml")
     config = Config(plugins=[{"path": str(Path(__file__).resolve().parents[1])}])
+    generation = prepare_plugins(config, runtime_paths)
+    assert not generation.skipped
+    # Publishing replaces every installed plugin module, the package conftest.py bootstraps included.
+    bootstrapped = {name: module for name, module in sys.modules.items() if name.startswith(PACKAGE_NAME)}
 
+    publish_plugins(generation)
     try:
+        plugins = config_plugins(config, runtime_paths)
         with patch("mindroom.tool_system.metadata.ensure_tool_deps", return_value=False) as ensure_deps:
-            plugins = load_plugins(config, runtime_paths, set_skill_roots=False, skip_broken_plugins=False)
             deep_research = resolve_tool_by_name(
                 "deep_research",
                 runtime_paths,
+                tools=plugins.tools,
                 worker_target=None,
             )
-            serper = resolve_tool_by_name("serper", runtime_paths, worker_target=None)
-            website = resolve_tool_by_name("website", runtime_paths, worker_target=None)
-            deep_research_metadata = TOOL_METADATA["deep_research"]
+            serper = resolve_tool_by_name("serper", runtime_paths, tools=plugins.tools, worker_target=None)
+            website = resolve_tool_by_name("website", runtime_paths, tools=plugins.tools, worker_target=None)
+        deep_research_metadata = plugins.tools.entries["deep_research"]
     finally:
-        restore_tool_registry_snapshot(snapshot)
+        publish_plugins(PluginGeneration())
+        sys.modules.update(bootstrapped)
 
-    assert [plugin.name for plugin in plugins] == ["deep-research"]
+    assert [plugin.name for plugin in plugins.loaded_plugins] == ["deep-research"]
     assert type(deep_research).__name__ == "DeepResearchTools"
     assert deep_research_metadata.status is ToolStatus.REQUIRES_CONFIG
     assert deep_research_metadata.setup_type is SetupType.API_KEY
@@ -211,7 +216,6 @@ async def test_happy_path_payload_is_valid_sorted_json() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=sender)),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
@@ -243,11 +247,9 @@ async def test_model_override_precedence_and_execution_identity_are_wired() -> N
     module = _load_tools_module()
     tools = module.DeepResearchTools()
     context = _tool_context(sender=AsyncMock())
-    execution_identity = object()
 
     with (
         tool_runtime_context(context),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=execution_identity),
         patch.object(module, "build_model_provider", return_value=object()) as build_provider,
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
@@ -260,7 +262,7 @@ async def test_model_override_precedence_and_execution_identity_are_wired() -> N
         context.config,
         context.runtime_paths,
         "override",
-        execution_identity=execution_identity,
+        execution_identity=context.execution_identity,
     )
     resolve_model.assert_not_called()
 
@@ -273,7 +275,6 @@ async def test_active_model_precedes_runtime_resolution() -> None:
 
     with (
         tool_runtime_context(context),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()) as build_provider,
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
@@ -294,7 +295,6 @@ async def test_runtime_model_resolution_fallback_when_no_active_model() -> None:
 
     with (
         tool_runtime_context(context),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()) as build_provider,
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
@@ -341,7 +341,6 @@ async def test_extract_model_routes_to_separate_model_instance() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", side_effect=[object(), object()]) as build_provider,
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
@@ -375,7 +374,6 @@ async def test_parallel_researchers_dispatches_heavy_mode() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock()) as single_mock,
@@ -401,7 +399,6 @@ async def test_ground_fn_is_wired_into_loop_kwargs() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))) as loop_mock,
@@ -424,7 +421,6 @@ async def test_verbosity_silent_sends_no_progress_messages() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=sender)),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", side_effect=fake_loop),
@@ -457,7 +453,6 @@ async def test_verbosity_progress_sends_start_round_and_done() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=sender)),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", side_effect=fake_loop),
@@ -479,7 +474,6 @@ async def test_progress_message_failures_do_not_abort_research() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=sender)),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
@@ -503,7 +497,6 @@ async def test_start_and_done_progress_emit_timeouts_do_not_hang_tool() -> None:
     with (
         tool_runtime_context(_tool_context(sender=sender)),
         patch.object(module, "PROGRESS_EMIT_TIMEOUT_SECONDS", 0.01),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
@@ -528,7 +521,6 @@ async def test_start_and_done_progress_emits_share_wall_clock_budget() -> None:
     with (
         tool_runtime_context(_tool_context(sender=sender)),
         patch.object(module, "clamp_int", side_effect=lambda value, minimum, maximum: value),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
@@ -556,7 +548,6 @@ async def test_arg_clamping_before_loop_call() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", side_effect=fake_loop),
@@ -593,7 +584,6 @@ async def test_depth_args_are_forwarded_to_loop_and_page_reader() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", side_effect=fake_loop),
@@ -620,6 +610,7 @@ async def test_depth_args_are_forwarded_to_loop_and_page_reader() -> None:
 async def test_tool_resolution_keeps_sandbox_proxy_enabled() -> None:
     module = _load_tools_module()
     tools = module.DeepResearchTools()
+    context = _tool_context(sender=AsyncMock())
     calls: list[dict[str, Any]] = []
 
     def tool_by_name(name: str, *_args: Any, **kwargs: Any) -> Any:
@@ -627,8 +618,7 @@ async def test_tool_resolution_keeps_sandbox_proxy_enabled() -> None:
         return _tool_by_name(name)
 
     with (
-        tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
+        tool_runtime_context(context),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
@@ -638,6 +628,7 @@ async def test_tool_resolution_keeps_sandbox_proxy_enabled() -> None:
     assert result["status"] == "ok"
     assert calls
     assert all(call.get("runs_in_worker") is not False for call in calls)
+    assert all(call["tools"] is context.plugins.tools for call in calls)
 
 
 @pytest.mark.parametrize(
@@ -703,7 +694,6 @@ async def test_search_and_read_call_the_toolkits_functions_not_its_same_named_me
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", side_effect=fake_loop),
@@ -743,7 +733,6 @@ async def test_serper_error_payload_returns_search_warning() -> None:
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
         patch.object(module, "_ask_model", ask_model),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
     ):
@@ -794,7 +783,6 @@ async def test_website_error_payload_returns_read_warning() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", side_effect=fake_loop),
@@ -846,7 +834,6 @@ async def test_read_boundary_uses_native_website_hardening_without_serper_fallba
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", side_effect=fake_loop),
@@ -870,7 +857,6 @@ async def test_serper_unconfigured_returns_clear_error(monkeypatch: pytest.Monke
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock()) as loop_mock,
@@ -927,7 +913,6 @@ async def test_custom_search_backend_serves_all_query_kinds() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", side_effect=fake_loop),
@@ -963,7 +948,6 @@ async def test_custom_async_search_function_is_awaited() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", side_effect=fake_loop),
@@ -998,7 +982,6 @@ async def test_search_tool_resolution_uses_calling_agents_authored_overrides() -
 
     with (
         tool_runtime_context(context),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
@@ -1086,7 +1069,6 @@ async def test_a_search_tool_that_cannot_search_the_web_fails_before_research() 
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", loop),
@@ -1120,7 +1102,6 @@ async def test_a_search_kind_the_tool_lacks_is_dropped_and_falls_back_to_web() -
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", loop),
@@ -1147,7 +1128,6 @@ async def test_a_run_whose_every_search_failed_and_found_no_sources_is_an_error(
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=failed)),
@@ -1176,7 +1156,6 @@ async def test_a_run_with_a_working_search_or_a_source_stays_ok(failures: int, h
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=partial)),
@@ -1213,6 +1192,7 @@ async def test_integration_smoke_live_research() -> None:
         client=AsyncMock(),
         config=config,
         runtime_paths=runtime_paths,
+        plugins=config_plugins(config, runtime_paths),
         conversation_reader=AsyncMock(),
         relations=AsyncMock(),
         active_model_name=model_name,
@@ -1336,7 +1316,6 @@ async def test_search_channels_route_by_kind_and_advertise_to_reasoner() -> None
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", side_effect=fake_loop),
@@ -1377,7 +1356,6 @@ async def test_unavailable_search_channel_degrades_with_warning() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", side_effect=fake_loop),
@@ -1424,7 +1402,6 @@ async def test_search_channel_tools_resolve_with_agent_authored_overrides() -> N
 
     with (
         tool_runtime_context(context),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
@@ -1556,7 +1533,6 @@ async def test_mcp_bridge_channel_uses_arguments_template_awaits_a_vendor_async_
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", side_effect=fake_loop),
@@ -1667,7 +1643,6 @@ async def test_ground_fn_is_wired_into_heavy_mode_loop_kwargs() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_heavy_research_loop", AsyncMock(return_value=_result(module))) as heavy_mock,
@@ -1685,7 +1660,6 @@ async def test_grounding_false_disables_the_gate() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))) as loop_mock,
@@ -1703,7 +1677,6 @@ async def test_ground_model_routes_to_separate_model_instance() -> None:
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", side_effect=[object(), object()]) as build_provider,
         patch.object(module, "get_tool_by_name", side_effect=_tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
@@ -1761,7 +1734,6 @@ async def test_channel_toolkits_resolve_with_callers_worker_target_and_config() 
     with (
         tool_runtime_context(context),
         patch.object(type(context), "resolve_worker_target", lambda _self: sentinel_target),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
@@ -1806,7 +1778,6 @@ async def test_worker_target_resolution_failure_is_loud() -> None:
     with (
         tool_runtime_context(context),
         patch.object(type(context), "resolve_worker_target", explode),
-        patch.object(module, "build_execution_identity_from_runtime_context", return_value=object()),
         patch.object(module, "build_model_provider", return_value=object()),
         patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
         patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
