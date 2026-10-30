@@ -14,8 +14,14 @@ from agno.tools.function import ToolResult
 from agno.tools.serper import SerperTools
 
 from mindroom.config.main import Config
-from mindroom.plugin_api import Toolkit, ToolRuntimeContext, ToolValue, toolkit_functions
-from mindroom.turn_model import ModelScope, resolve_turn_model
+from mindroom.plugin_api import (
+    ModelScope,
+    Toolkit,
+    ToolRuntimeContext,
+    ToolValue,
+    resolve_turn_model,
+    toolkit_functions,
+)
 
 
 def test_runtime_provides_typed_worker_target_api() -> None:
