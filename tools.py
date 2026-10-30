@@ -25,14 +25,12 @@ from mindroom.plugin_api import (
     ToolFileAccess,
     ToolStatus,
     ToolValue,
-    build_execution_identity_from_runtime_context,
     build_model_provider,
     complete_prompt,
     get_logger,
     get_tool_by_name,
     get_tool_runtime_context,
     register_tool_with_metadata,
-    resolve_tool_runtime_hook_bindings,
     resolve_turn_model,
     toolkit_functions,
 )
@@ -440,15 +438,15 @@ def _authored_tool_overrides(context: ToolRuntimeContext, tool_name: str) -> dic
 
 
 async def _emit_message(context: ToolRuntimeContext, text: str, *, timeout_seconds: float = PROGRESS_EMIT_TIMEOUT_SECONDS) -> None:
-    bindings = resolve_tool_runtime_hook_bindings(context)
-    if bindings.message_sender is None:
+    message_sender = context.hooks.message_sender
+    if message_sender is None:
         return
     if timeout_seconds <= 0:
         LOGGER.warning("deep_research_progress_emit_skipped_budget_exhausted")
         return
     try:
         async with asyncio.timeout(min(PROGRESS_EMIT_TIMEOUT_SECONDS, timeout_seconds)):
-            await bindings.message_sender(
+            await message_sender(
                 context.room_id,
                 text,
                 context.resolved_thread_id or context.thread_id,
@@ -577,7 +575,7 @@ class DeepResearchTools(Toolkit):
             model_name = _resolve_model_name(context, model)
             extract_model_name = _resolve_model_name(context, extract_model) if extract_model else model_name
             ground_model_name = _resolve_model_name(context, ground_model) if ground_model else model_name
-            execution_identity = build_execution_identity_from_runtime_context(context)
+            execution_identity = context.execution_identity
             live_model = build_model_provider(
                 context.config,
                 context.runtime_paths,
@@ -614,6 +612,7 @@ class DeepResearchTools(Toolkit):
             search_toolkit = get_tool_by_name(
                 search_tool_name,
                 context.runtime_paths,
+                tools=context.plugins.tools,
                 tool_config_overrides=search_overrides or None,
                 worker_target=None,
             )
@@ -661,6 +660,7 @@ class DeepResearchTools(Toolkit):
                 channel_toolkit = get_tool_by_name(
                     channel_config.tool,
                     context.runtime_paths,
+                    tools=context.plugins.tools,
                     tool_config_overrides=_authored_tool_overrides(context, channel_config.tool) or None,
                     allowed_shared_services=channel_shared_services,
                     worker_target=channel_worker_target,
@@ -686,7 +686,12 @@ class DeepResearchTools(Toolkit):
         prompt_channels.extend((name, channel.description) for name, channel in channels.items())
 
         try:
-            website = get_tool_by_name("website", context.runtime_paths, worker_target=None)
+            website = get_tool_by_name(
+                "website",
+                context.runtime_paths,
+                tools=context.plugins.tools,
+                worker_target=None,
+            )
             read_url = _tool_function(toolkit_functions(website), "read_url")
         except Exception as exc:
             LOGGER.warning("deep_research_website_unavailable", error=str(exc))
