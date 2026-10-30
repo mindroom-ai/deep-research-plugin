@@ -1706,7 +1706,7 @@ async def test_channel_toolkits_resolve_with_callers_worker_target_and_config() 
     context = _tool_context(sender=AsyncMock())
     sentinel_target = SimpleNamespace(worker_scope="user_agent", worker_key="user_agent:bas:code")
     context.config.get_worker_grantable_credentials = lambda: frozenset({"google_vertex_adc"})
-    calls: list[tuple[str, Any, Any, Any]] = []
+    calls: list[tuple[str, Any, Any, Any, Any]] = []
 
     class GroundedSearch(Toolkit):
         @tool
@@ -1721,7 +1721,13 @@ async def test_channel_toolkits_resolve_with_callers_worker_target_and_config() 
 
     def tool_by_name(name: str, *_args: Any, **kwargs: Any) -> Any:
         calls.append(
-            (name, kwargs.get("worker_target"), kwargs.get("allowed_shared_services"), kwargs.get("runtime_config")),
+            (
+                name,
+                kwargs.get("tools"),
+                kwargs.get("worker_target"),
+                kwargs.get("allowed_shared_services"),
+                kwargs.get("runtime_config"),
+            ),
         )
         if name == "grounded_search":
             return GroundedSearch()
@@ -1741,12 +1747,14 @@ async def test_channel_toolkits_resolve_with_callers_worker_target_and_config() 
         result = json.loads(await tools.deep_research("What?"))
 
     assert result["status"] == "ok"
-    # The MCP channel is built with the caller's worker target, grantable
-    # shared services, and config, which place it and reach its worker; the
-    # main search backend and website reader keep their previous unscoped build.
-    assert ("mcp_wiki", sentinel_target, frozenset({"google_vertex_adc"}), context.config) in calls
-    assert ("grounded_search", None, None, None) in calls
-    assert ("website", None, None, None) in calls
+    # Every toolkit comes from the turn's tool registry. The MCP channel is
+    # built with the caller's worker target, grantable shared services, and
+    # config, which place it and reach its worker; the main search backend and
+    # website reader keep their previous unscoped build.
+    tools_registry = context.plugins.tools
+    assert ("mcp_wiki", tools_registry, sentinel_target, frozenset({"google_vertex_adc"}), context.config) in calls
+    assert ("grounded_search", tools_registry, None, None, None) in calls
+    assert ("website", tools_registry, None, None, None) in calls
 
 
 @pytest.mark.asyncio
