@@ -45,9 +45,10 @@ agents:
 ```
 
 Update later with `mindroom plugins update deep-research-plugin`.
+Needs MindRoom v2026.10.715 or later.
 No extra Python dependencies or external research services are required.
 
-## Tool
+## Tools
 
 The plugin registers the `deep_research` toolkit exposing one agent tool:
 
