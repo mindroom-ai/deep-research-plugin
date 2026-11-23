@@ -12,7 +12,7 @@
 
 A [MindRoom](https://github.com/mindroom-ai/mindroom) tool plugin that runs a bounded, multi-round web research loop and returns a cited Markdown report, powered by the calling agent's own model.
 
-Ask one hard question and `deep_research` searches, reads primary sources, compresses findings between rounds so long runs stay inside context, and verifies cited claims before answering.
+Ask one hard question and `deep_research` searches, reads primary sources, compresses findings between rounds so long runs stay inside context, and runs a best-effort grounding check on cited claims before answering (it can be disabled via `grounding=False`, skipped near the deadline, or fail while still returning a report—check `warnings`).
 
 > **Prompt:** Compare HTTP/3 adoption and fallback latency across Cloudflare, Fastly, and AWS CloudFront.
 >
@@ -88,7 +88,7 @@ Configure optional settings on the agent's `deep_research` entry in `config.yaml
 **Output envelope:**
 
 - **Success (`status: "ok"`):** `status`, `tool` (`"deep_research"`), `question`, `report` (cited Markdown with `[n]` references and rebuilt `## Sources`), `sources`, `sources_considered`, `sources_used`, `confidence`, `rounds_used`, `stopped_reason`, `elapsed_seconds`, `warnings`, and `stats`.
-- **`stopped_reason`:** `confident`, `model_finished`, `no_progress`, `max_rounds`, `wall_clock`, or `synthesis_truncated` (only the last means the final report itself was cut short).
+- **`stopped_reason`:** `confident`, `model_finished`, `no_progress`, `max_rounds`, `wall_clock`, or `synthesis_truncated` (in single-researcher runs, only `synthesis_truncated` means final synthesis was cut short; in heavy mode, `synthesis_truncated` can also come from a researcher—when every surviving researcher stops with it—even when final synthesis finishes).
 - **`stats`:** counts of `searches`, `search_attempts`, `search_failures`, `reads`, `read_attempts`, `read_failures`, `extractions`, `duplicate_queries_skipped`, `duplicate_reads_skipped`, `read_snippet_fallbacks`, `snippet_sources_registered`, `grounding_issues`, `grounding_regenerations`, and `finished_with_open_questions` (plus `cross_researcher_reads_shared` and `cross_researcher_extracts_shared` in heavy mode).
 - **Error (`status: "error"`):** `status`, `tool`, `message`, and `warnings` (also returned when every search fails and no source is found).
 
@@ -147,7 +147,7 @@ agents:
 - **Inherited settings & OAuth:** Search and channel tools inherit the agent's authored overrides for those tools except function-hiding switches (`enable_*`/`all: false`, `include_tools`, `exclude_tools`). Extra channels also inherit the agent's worker target so OAuth-backed MCP tools run with the requester's session.
 - **Fallback behavior:** A missing `web` function on `search_tool` fails immediately; missing `news`/`scholar` functions or unavailable channels drop with a warning. `web`, `news`, and `scholar` are reserved names, and unknown kinds fall back to `web`.
 - **Call contract:** Without `arguments`, functions are called as `fn(query)` (plus `num_results` if accepted). With `arguments`, `{query}` and `{num_results}` are substituted—exact placeholders preserve type (`"{num_results}"` becomes an integer). Async functions and MCP result objects (`ToolResult`/`ToolValue`) are supported.
-- **Result JSON shapes:** Accepts a top-level list or an object with `organic`/`news`/`articles`/`scholar`/`results`/`sources`/`items`/`documents` rows carrying URL (`link`/`url`/`uri`/`permalink`), title, and snippet fields. Payloads with `error` or `status: "error"` count as failures; internal URLs the `website` reader cannot fetch degrade to snippet sources.
+- **Result JSON shapes:** Custom search functions must return a **JSON-encoded string** (or an MCP `ToolResult`/`ToolValue` whose content is a JSON-encoded string), not a raw Python `list`/`dict`. The JSON string must parse to a top-level list or an object with `organic`/`news`/`articles`/`scholar`/`results`/`sources`/`items`/`documents` rows carrying URL (`link`/`url`/`uri`/`permalink`), title, and snippet fields. Payloads with `error` or `status: "error"` count as failures; internal URLs the `website` reader cannot fetch degrade to snippet sources.
 
 </details>
 
