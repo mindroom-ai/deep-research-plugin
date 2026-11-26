@@ -856,7 +856,7 @@ async def test_serper_unconfigured_returns_clear_error(
     module = _load_tools_module()
     tools = module.DeepResearchTools()
     monkeypatch.delenv("SERPER_API_KEY", raising=False)
-    runtime_paths = resolve_primary_runtime_paths(config_path=tmp_path / "config.yaml")
+    runtime_paths = resolve_primary_runtime_paths(config_path=tmp_path / "config.yaml", process_env={})
     plugins = config_plugins(Config(), runtime_paths)
     unconfigured_serper = resolve_tool_by_name("serper", runtime_paths, tools=plugins.tools, worker_target=None)
 
