@@ -18,16 +18,12 @@ from uuid import uuid4
 
 import pytest
 
-from agno.tools import Toolkit as AgnoToolkit
-from agno.tools.function import ToolResult
-from agno.tools.serper import SerperTools
-
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config, load_config
 from mindroom.config.models import DefaultsConfig
 from mindroom.constants import resolve_primary_runtime_paths
 from mindroom.message_target import MessageTarget
-from mindroom.plugin_api import HookBindings, Toolkit, tool, toolkit_functions
+from mindroom.plugin_api import HookBindings, Toolkit, ToolValue, tool, toolkit_functions
 from mindroom.tool_system.declarations import SetupType, ToolStatus
 from mindroom.tool_system.metadata import get_tool_by_name as resolve_tool_by_name
 from mindroom.tool_system.plugins import PluginGeneration, config_plugins, prepare_plugins, publish_plugins
@@ -95,8 +91,8 @@ def _tool_context(
     )
 
 
-class _FakeSerper(AgnoToolkit):
-    """A vendor toolkit, as Agno's Serper is; a subclass's overrides are its functions."""
+class _FakeSerper(Toolkit):
+    """Test double for the Serper toolkit; a subclass's overrides are its functions."""
 
     api_key = "key"
 
@@ -177,16 +173,21 @@ def test_plugin_discovery_registers_tool_and_builtin_dependencies_resolve(tmp_pa
             serper = resolve_tool_by_name("serper", runtime_paths, tools=plugins.tools, worker_target=None)
             website = resolve_tool_by_name("website", runtime_paths, tools=plugins.tools, worker_target=None)
         deep_research_metadata = plugins.tools.entries["deep_research"]
+        serper_metadata = plugins.tools.entries["serper"]
     finally:
         publish_plugins(PluginGeneration())
         sys.modules.update(bootstrapped)
 
     assert [plugin.name for plugin in plugins.loaded_plugins] == ["deep-research"]
+    assert isinstance(deep_research, Toolkit)
     assert type(deep_research).__name__ == "DeepResearchTools"
+    assert "deep_research" in toolkit_functions(deep_research)
     assert deep_research_metadata.status is ToolStatus.REQUIRES_CONFIG
     assert deep_research_metadata.setup_type is SetupType.API_KEY
     checked_dependency_sets = {tuple(call.args[0]) for call in ensure_deps.call_args_list}
-    assert ("requests",) in checked_dependency_sets
+    serper_dependencies = tuple(serper_metadata.dependencies)
+    assert serper_dependencies in {("requests",), ("httpx",)}
+    assert serper_dependencies in checked_dependency_sets
     assert ("httpx", "beautifulsoup4") in checked_dependency_sets
     assert {"search_web", "search_news", "search_scholar"} <= set(toolkit_functions(serper))
     assert "read_url" in toolkit_functions(website)
@@ -663,7 +664,9 @@ async def test_search_and_read_call_the_toolkits_functions_not_its_same_named_me
     class EntrypointSerper(Toolkit):
         @tool(name="search_web")
         def entrypoint_search_web(self, query: str, num_results: int | None = None) -> str:
-            return json.dumps({"organic": [{"link": "https://example.com", "title": query, "snippet": str(num_results)}]})
+            return json.dumps(
+                {"organic": [{"link": "https://example.com", "title": query, "snippet": str(num_results)}]}
+            )
 
         def search_web(self, _query: str, num_results: int | None = None) -> str:
             raise AssertionError("direct search method bypassed the toolkit's function")
@@ -846,14 +849,19 @@ async def test_read_boundary_uses_native_website_hardening_without_serper_fallba
 
 
 @pytest.mark.asyncio
-async def test_serper_unconfigured_returns_clear_error(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_serper_unconfigured_returns_clear_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     module = _load_tools_module()
     tools = module.DeepResearchTools()
     monkeypatch.delenv("SERPER_API_KEY", raising=False)
-    from agno.tools.serper import SerperTools
+    runtime_paths = resolve_primary_runtime_paths(config_path=tmp_path / "config.yaml", process_env={})
+    plugins = config_plugins(Config(), runtime_paths)
+    unconfigured_serper = resolve_tool_by_name("serper", runtime_paths, tools=plugins.tools, worker_target=None)
 
     def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
-        return SerperTools(api_key=None) if name == "serper" else _FakeWebsite()
+        return unconfigured_serper if name == "serper" else _FakeWebsite()
 
     with (
         tool_runtime_context(_tool_context(sender=AsyncMock())),
@@ -866,6 +874,36 @@ async def test_serper_unconfigured_returns_clear_error(monkeypatch: pytest.Monke
     assert result["status"] == "error"
     assert "Search tool 'serper' is not configured" in result["message"]
     loop_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_custom_search_tool_with_optional_none_api_key_is_allowed() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools(search_tool="oauth_search", search_function="search_public_web")
+
+    class OAuthSearch(Toolkit):
+        api_key = None
+
+        @tool
+        def search_public_web(self, _query: str) -> str:
+            return json.dumps({"sources": []})
+
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
+        if name == "oauth_search":
+            return OAuthSearch()
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_model_provider", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", AsyncMock(return_value=_result(module))),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
 
 
 def test_parse_search_results_raises_on_status_error_payload() -> None:
@@ -1037,13 +1075,22 @@ def test_authored_tool_overrides_keep_an_enable_for_a_function_that_defaults_off
     assert module._authored_tool_overrides(context, "firecrawl") == {"enable_search": True, "all": True}
 
 
-def test_search_toolkit_keeps_the_searches_an_agent_hid_from_itself() -> None:
+def test_search_toolkit_keeps_the_searches_an_agent_hid_from_itself(tmp_path: Path) -> None:
     module = _load_tools_module()
     hidden = {"enable_search": False, "enable_search_news": False, "enable_scrape_webpage": False, "num_results": 7}
     agent = SimpleNamespace(tools=[SimpleNamespace(name="serper", overrides=hidden)])
     context = SimpleNamespace(agent_name="code", config=SimpleNamespace(get_agent=lambda _name: agent))
+    runtime_paths = resolve_primary_runtime_paths(config_path=tmp_path / "config.yaml")
+    plugins = config_plugins(Config(), runtime_paths)
 
-    toolkit = SerperTools(api_key="key", **module._authored_tool_overrides(context, "serper"))
+    toolkit = resolve_tool_by_name(
+        "serper",
+        runtime_paths,
+        tools=plugins.tools,
+        credential_overrides={"api_key": "key"},
+        tool_config_overrides=module._authored_tool_overrides(context, "serper"),
+        worker_target=None,
+    )
 
     assert {"search_web", "search_news", "search_scholar"} <= set(toolkit_functions(toolkit))
     assert toolkit.num_results == 7
@@ -1503,9 +1550,9 @@ async def test_mcp_bridge_channel_uses_arguments_template_awaits_a_vendor_async_
     )
     bridge_calls: list[dict[str, Any]] = []
 
-    async def wiki_call_tool(*, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
+    async def wiki_call_tool(*, tool_name: str, arguments: dict[str, Any]) -> ToolValue:
         bridge_calls.append({"tool_name": tool_name, "arguments": arguments})
-        return ToolResult(
+        return ToolValue(
             content=json.dumps(
                 {"documents": [{"url": "https://wiki.example/doc/1", "title": "Doc", "context": "wiki fact"}]},
             ),
@@ -1520,7 +1567,7 @@ async def test_mcp_bridge_channel_uses_arguments_template_awaits_a_vendor_async_
         if name == "grounded_search":
             return GroundedSearch()
         if name == "mcp_wiki":
-            return AgnoToolkit(name="mcp_wiki", tools=[wiki_call_tool])
+            return Toolkit(name="mcp_wiki", tools=[wiki_call_tool])
         if name == "website":
             return _FakeWebsite()
         raise AssertionError(name)
@@ -1561,10 +1608,11 @@ def test_result_text_accepts_str_and_tool_results_and_rejects_everything_else() 
     module = _load_tools_module()
 
     assert module._result_text("already text") == "already text"
-    assert module._result_text(ToolResult(content='{"results": []}')) == '{"results": []}'
-    assert module._result_text(module.ToolValue(content='{"results": []}')) == '{"results": []}'
-    with pytest.raises(TypeError, match="unsupported result type"):
-        module._result_text(42)
+    assert module._result_text(ToolValue(content='{"results": []}')) == '{"results": []}'
+    assert module._result_text(SimpleNamespace(content='{"results": []}')) == '{"results": []}'
+    for bad_value in (42, None, {"content": "nope"}, SimpleNamespace(content=123), SimpleNamespace(content=None)):
+        with pytest.raises(TypeError, match="unsupported result type"):
+            module._result_text(bad_value)
 
 
 def test_parse_search_channels_accepts_json_object_strings() -> None:

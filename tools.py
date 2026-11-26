@@ -12,9 +12,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from agno.tools import Toolkit
-from agno.tools.function import ToolResult
-from agno.tools.serper import SerperTools
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 from mindroom.plugin_api import (
@@ -23,6 +20,7 @@ from mindroom.plugin_api import (
     SetupType,
     ToolCategory,
     ToolFileAccess,
+    Toolkit,
     ToolStatus,
     ToolValue,
     build_model_provider,
@@ -32,6 +30,7 @@ from mindroom.plugin_api import (
     get_tool_runtime_context,
     register_tool_with_metadata,
     resolve_turn_model,
+    tool,
     toolkit_functions,
 )
 
@@ -67,6 +66,7 @@ DEFAULT_SEARCH_TOOL = "serper"
 SERPER_SEARCH_FUNCTIONS = {"web": "search_web", "news": "search_news", "scholar": "search_scholar"}
 HIT_SNIPPET_CHAR_LIMIT = 500
 _PLACEHOLDER_RE = re.compile(r"\{query\}|\{num_results\}")
+_MISSING = object()
 
 
 class _ChannelConfig(BaseModel):
@@ -382,7 +382,9 @@ def _substitute_placeholders(value: object, *, query: str, num_results: int) -> 
             value,
         )
     if isinstance(value, dict):
-        return {key: _substitute_placeholders(item, query=query, num_results=num_results) for key, item in value.items()}
+        return {
+            key: _substitute_placeholders(item, query=query, num_results=num_results) for key, item in value.items()
+        }
     if isinstance(value, list):
         return [_substitute_placeholders(item, query=query, num_results=num_results) for item in value]
     return value
@@ -407,21 +409,31 @@ async def _call_search_function(
 def _result_text(raw: object) -> str:
     """Normalize a search call's return value to text.
 
-    Search callables return plain text; MindRoom's MCP toolkits return an
-    agno ToolResult or a MindRoom ToolValue whose content is already
-    normalized to a string.
+    Search callables return plain text, a MindRoom ``ToolValue``, or a
+    result object carrying a string ``content`` attribute.
     Anything else is a contract violation and fails loudly.
     """
     if isinstance(raw, str):
         return raw
-    if isinstance(raw, (ToolResult, ToolValue)):
+    if isinstance(raw, ToolValue):
         return raw.content
+    content = getattr(raw, "content", None)
+    if isinstance(content, str):
+        return content
     msg = f"Search function returned an unsupported result type: {type(raw).__name__}"
     raise TypeError(msg)
 
 
+def _has_unset_api_key(toolkit: object) -> bool:
+    """Return True when a toolkit exposes an ``api_key`` attribute that is empty."""
+    api_key = getattr(toolkit, "api_key", _MISSING)
+    if api_key is _MISSING:
+        return False
+    return not (api_key.strip() if isinstance(api_key, str) else api_key)
+
+
 def _hides_functions(key: str, value: object) -> bool:
-    # Agno toolkits name their function switches `enable_<function>` and `all`; an enabled one is kept,
+    # Toolkits name their per-function switches `enable_<function>` and `all`; an enabled one is kept,
     # since some functions, such as Firecrawl's search, are off unless enabled.
     return key in {"include_tools", "exclude_tools"} or ((key == "all" or key.startswith("enable_")) and not value)
 
@@ -437,7 +449,9 @@ def _authored_tool_overrides(context: ToolRuntimeContext, tool_name: str) -> dic
     return {}
 
 
-async def _emit_message(context: ToolRuntimeContext, text: str, *, timeout_seconds: float = PROGRESS_EMIT_TIMEOUT_SECONDS) -> None:
+async def _emit_message(
+    context: ToolRuntimeContext, text: str, *, timeout_seconds: float = PROGRESS_EMIT_TIMEOUT_SECONDS
+) -> None:
     message_sender = context.hooks.message_sender
     if message_sender is None:
         return
@@ -485,6 +499,12 @@ def _format_round_progress(event: dict[str, object], *, verbose: bool) -> str:
 class DeepResearchTools(Toolkit):
     """Toolkit exposing bounded web research as one MindRoom tool."""
 
+    name = TOOL_NAME
+    instructions = (
+        "Use deep_research for bounded, cited research over the web. "
+        "It returns a JSON envelope whose report field contains the final cited Markdown answer."
+    )
+
     def __init__(
         self,
         *,
@@ -496,15 +516,9 @@ class DeepResearchTools(Toolkit):
         self.search_tool = self.search_tool or DEFAULT_SEARCH_TOOL
         self.search_function = (search_function or "").strip() if isinstance(search_function, str) else ""
         self.search_channels = _parse_search_channels(search_channels)
-        super().__init__(
-            name=TOOL_NAME,
-            instructions=(
-                "Use deep_research for bounded, cited research over the web. "
-                "It returns a JSON envelope whose report field contains the final cited Markdown answer."
-            ),
-            tools=[self.deep_research],
-        )
+        super().__init__()
 
+    @tool
     async def deep_research(  # noqa: C901, PLR0911, PLR0915
         self,
         question: str,
@@ -622,10 +636,9 @@ class DeepResearchTools(Toolkit):
                 f"Search tool '{search_tool_name}' is not configured or unavailable. "
                 "Configure it to use deep_research.",
             )
-        if isinstance(search_toolkit, SerperTools) and not search_toolkit.api_key:
+        if search_tool_name == DEFAULT_SEARCH_TOOL and _has_unset_api_key(search_toolkit):
             return _error(
-                f"Search tool '{search_tool_name}' is not configured. "
-                "Configure its API key to use deep_research.",
+                f"Search tool '{search_tool_name}' is not configured. Configure its API key to use deep_research.",
             )
 
         # The search tool must answer web queries; a missing news or scholar
