@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import inspect
 import json
 import re
@@ -64,8 +63,9 @@ from .loop import (
 LOGGER = get_logger(__name__)
 TOOL_NAME = "deep_research"
 DEFAULT_SEARCH_TOOL = "serper"
-SERPER_SEARCH_FUNCTION = "serper_search"
+SERPER_CONSOLIDATED_FUNCTIONS = ("serper", "serper_search")
 SERPER_SEARCH_FUNCTIONS = {"web": "search_web", "news": "search_news", "scholar": "search_scholar"}
+WEBSITE_READ_FUNCTIONS = ("website_read_url", "read_url")
 HIT_SNIPPET_CHAR_LIMIT = 500
 _PLACEHOLDER_RE = re.compile(r"\{query\}|\{num_results\}")
 _MISSING = object()
@@ -337,12 +337,14 @@ def _parse_search_results(raw: str) -> list[SearchHit]:
     return hits
 
 
-def _tool_function(functions: Mapping[str, Callable[..., object]], function_name: str) -> Callable[..., object]:
-    function = functions.get(function_name)
-    if function is None:
-        msg = f"Tool function is unavailable: {function_name}"
-        raise RuntimeError(msg)
-    return function
+def _tool_function(functions: Mapping[str, Callable[..., object]], *function_names: str) -> Callable[..., object]:
+    for function_name in function_names:
+        function = functions.get(function_name)
+        if function is not None:
+            return function
+    unavailable = " / ".join(function_names)
+    msg = f"Tool function is unavailable: {unavailable}"
+    raise RuntimeError(msg)
 
 
 @dataclass(frozen=True)
@@ -352,14 +354,14 @@ class _OfferedFunctionProbe:
     parameters: dict[str, object]
 
 
-def _enabled_serper_actions(search_toolkit: object) -> set[str]:
-    """Return the search kinds enabled on a consolidated ``serper_search`` tool."""
+def _enabled_serper_actions(search_toolkit: object, *, function_name: str) -> set[str]:
+    """Return the search kinds enabled on a consolidated Serper tool."""
     allowed = set(SERPER_SEARCH_FUNCTIONS)
     offered_function = getattr(search_toolkit, "offered_function", None)
     if not callable(offered_function):
         return allowed
     probe = _OfferedFunctionProbe(
-        name=SERPER_SEARCH_FUNCTION,
+        name=function_name,
         description=None,
         parameters={"properties": {"action": {"type": "string", "enum": list(SERPER_SEARCH_FUNCTIONS)}}},
     )
@@ -376,6 +378,33 @@ def _enabled_serper_actions(search_toolkit: object) -> set[str]:
     return allowed
 
 
+def _bind_consolidated_search(function: Callable[..., object], action: str) -> Callable[..., object]:
+    """Bind ``action`` onto a consolidated Serper function regardless of parameter order."""
+    accepts_query = _accepts_keyword(function, "query")
+    accepts_num_results = _accepts_keyword(function, "num_results")
+    if inspect.iscoroutinefunction(function):
+
+        async def _async_call(query: str, num_results: int | None = None) -> object:
+            kwargs: dict[str, object] = {"action": action}
+            if accepts_num_results and num_results is not None:
+                kwargs["num_results"] = num_results
+            if accepts_query:
+                return await function(query=query, **kwargs)
+            return await function(query, **kwargs)
+
+        return _async_call
+
+    def _sync_call(query: str, num_results: int | None = None) -> object:
+        kwargs: dict[str, object] = {"action": action}
+        if accepts_num_results and num_results is not None:
+            kwargs["num_results"] = num_results
+        if accepts_query:
+            return function(query=query, **kwargs)
+        return function(query, **kwargs)
+
+    return _sync_call
+
+
 def _resolve_search_functions(
     search_toolkit: object,
     search_toolkit_functions: Mapping[str, Callable[..., object]],
@@ -383,20 +412,26 @@ def _resolve_search_functions(
     search_function: str,
 ) -> tuple[dict[str, Callable[..., object]], list[str]]:
     """Resolve ``web`` (required) and optional ``news``/``scholar`` search callables."""
+    consolidated_name = next(
+        (name for name in SERPER_CONSOLIDATED_FUNCTIONS if name in search_toolkit_functions),
+        None,
+    )
     if (
         not search_function
-        and SERPER_SEARCH_FUNCTION in search_toolkit_functions
+        and consolidated_name is not None
         and not any(name in search_toolkit_functions for name in SERPER_SEARCH_FUNCTIONS.values())
     ):
-        serper_search = search_toolkit_functions[SERPER_SEARCH_FUNCTION]
+        serper_search = search_toolkit_functions[consolidated_name]
         accepts_action = _accepts_keyword(serper_search, "action")
-        enabled_actions = _enabled_serper_actions(search_toolkit) if accepts_action else {"web"}
+        enabled_actions = (
+            _enabled_serper_actions(search_toolkit, function_name=consolidated_name) if accepts_action else {"web"}
+        )
         candidates = {
             kind: (
-                (functools.partial(serper_search, action=kind) if accepts_action else serper_search)
+                (_bind_consolidated_search(serper_search, kind) if accepts_action else serper_search)
                 if kind in enabled_actions
                 else None,
-                f"Tool action is unavailable: {SERPER_SEARCH_FUNCTION}(action={kind!r})",
+                f"Tool action is unavailable: {consolidated_name}(action={kind!r})",
             )
             for kind in SERPER_SEARCH_FUNCTIONS
         }
@@ -435,9 +470,10 @@ def _accepts_keyword(function: Callable[..., object], name: str) -> bool:
         parameters = inspect.signature(function).parameters
     except (TypeError, ValueError):
         return True
-    if name in parameters:
+    parameter = parameters.get(name)
+    if parameter is not None and parameter.kind is not inspect.Parameter.POSITIONAL_ONLY:
         return True
-    return any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    return any(param.kind is inspect.Parameter.VAR_KEYWORD for param in parameters.values())
 
 
 def _substitute_placeholders(value: object, *, query: str, num_results: int) -> object:
@@ -778,7 +814,7 @@ class DeepResearchTools(Toolkit):
                 tools=context.plugins.tools,
                 worker_target=None,
             )
-            read_url = _tool_function(toolkit_functions(website), "read_url")
+            read_url = _tool_function(toolkit_functions(website), *WEBSITE_READ_FUNCTIONS)
         except Exception as exc:
             LOGGER.warning("deep_research_website_unavailable", error=str(exc))
             return _error(f"Website reader is unavailable: {exc}")
@@ -913,7 +949,7 @@ _CONFIG_FIELDS = [
         default="",
         description=(
             "Search-tool function used for every query kind. Leave empty for Serper's "
-            "serper_search (web/news/scholar) or legacy search_web / search_news / search_scholar routing."
+            "serper / serper_search (web/news/scholar) or legacy search_web / search_news / search_scholar routing."
         ),
     ),
     ConfigField(

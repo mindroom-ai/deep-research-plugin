@@ -66,9 +66,10 @@ def test_toolkit_and_result_contracts(tmp_path: Path) -> None:
     )
     assert getattr(serper, "api_key", None) == "k"
     serper_functions = toolkit_functions(serper)
-    if "serper_search" in serper_functions:
+    consolidated_serper = next((name for name in ("serper", "serper_search") if name in serper_functions), None)
+    if consolidated_serper is not None:
         assert {"query", "action", "num_results"} <= set(
-            inspect.signature(serper_functions["serper_search"]).parameters,
+            inspect.signature(serper_functions[consolidated_serper]).parameters,
         )
         assert callable(getattr(serper, "offered_function", None))
     else:
