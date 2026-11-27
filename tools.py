@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import json
 import re
@@ -63,6 +64,7 @@ from .loop import (
 LOGGER = get_logger(__name__)
 TOOL_NAME = "deep_research"
 DEFAULT_SEARCH_TOOL = "serper"
+SERPER_SEARCH_FUNCTION = "serper_search"
 SERPER_SEARCH_FUNCTIONS = {"web": "search_web", "news": "search_news", "scholar": "search_scholar"}
 HIT_SNIPPET_CHAR_LIMIT = 500
 _PLACEHOLDER_RE = re.compile(r"\{query\}|\{num_results\}")
@@ -341,6 +343,81 @@ def _tool_function(functions: Mapping[str, Callable[..., object]], function_name
         msg = f"Tool function is unavailable: {function_name}"
         raise RuntimeError(msg)
     return function
+
+
+@dataclass(frozen=True)
+class _OfferedFunctionProbe:
+    name: str
+    description: str | None
+    parameters: dict[str, object]
+
+
+def _enabled_serper_actions(search_toolkit: object) -> set[str]:
+    """Return the search kinds enabled on a consolidated ``serper_search`` tool."""
+    allowed = set(SERPER_SEARCH_FUNCTIONS)
+    offered_function = getattr(search_toolkit, "offered_function", None)
+    if not callable(offered_function):
+        return allowed
+    probe = _OfferedFunctionProbe(
+        name=SERPER_SEARCH_FUNCTION,
+        description=None,
+        parameters={"properties": {"action": {"type": "string", "enum": list(SERPER_SEARCH_FUNCTIONS)}}},
+    )
+    try:
+        offered = offered_function(probe)
+    except Exception:
+        return allowed
+    params = getattr(offered, "parameters", None)
+    props = params.get("properties") if isinstance(params, Mapping) else None
+    action_schema = props.get("action") if isinstance(props, Mapping) else None
+    enum = action_schema.get("enum") if isinstance(action_schema, Mapping) else None
+    if isinstance(enum, (list, tuple, set, frozenset)):
+        return allowed & {item for item in enum if isinstance(item, str)}
+    return allowed
+
+
+def _resolve_search_functions(
+    search_toolkit: object,
+    search_toolkit_functions: Mapping[str, Callable[..., object]],
+    *,
+    search_function: str,
+) -> tuple[dict[str, Callable[..., object]], list[str]]:
+    """Resolve ``web`` (required) and optional ``news``/``scholar`` search callables."""
+    if (
+        not search_function
+        and SERPER_SEARCH_FUNCTION in search_toolkit_functions
+        and not any(name in search_toolkit_functions for name in SERPER_SEARCH_FUNCTIONS.values())
+    ):
+        serper_search = search_toolkit_functions[SERPER_SEARCH_FUNCTION]
+        accepts_action = _accepts_keyword(serper_search, "action")
+        enabled_actions = _enabled_serper_actions(search_toolkit) if accepts_action else {"web"}
+        candidates = {
+            kind: (
+                (functools.partial(serper_search, action=kind) if accepts_action else serper_search)
+                if kind in enabled_actions
+                else None,
+                f"Tool action is unavailable: {SERPER_SEARCH_FUNCTION}(action={kind!r})",
+            )
+            for kind in SERPER_SEARCH_FUNCTIONS
+        }
+    else:
+        wanted = {"web": search_function} if search_function else SERPER_SEARCH_FUNCTIONS
+        candidates = {
+            kind: (search_toolkit_functions.get(name), f"Tool function is unavailable: {name}")
+            for kind, name in wanted.items()
+        }
+
+    search_functions: dict[str, Callable[..., object]] = {}
+    warnings: list[str] = []
+    for kind, (function, unavailable_msg) in candidates.items():
+        if function is not None:
+            search_functions[kind] = function
+            continue
+        if kind == "web":
+            raise RuntimeError(unavailable_msg)
+        LOGGER.warning("deep_research_search_kind_unavailable", kind=kind, error=unavailable_msg)
+        warnings.append(f"search kind '{kind}' unavailable: {unavailable_msg}")
+    return search_functions, warnings
 
 
 async def _call_tool_function(function: Callable[..., object], *args: object, **kwargs: object) -> str:
@@ -643,18 +720,14 @@ class DeepResearchTools(Toolkit):
 
         # The search tool must answer web queries; a missing news or scholar
         # search is dropped with a warning, like an extra channel below.
-        channel_warnings: list[str] = []
-        wanted_functions = {"web": self.search_function} if self.search_function else SERPER_SEARCH_FUNCTIONS
-        search_toolkit_functions = toolkit_functions(search_toolkit)
-        search_functions: dict[str, Callable[..., object]] = {}
-        for kind, function_name in wanted_functions.items():
-            try:
-                search_functions[kind] = _tool_function(search_toolkit_functions, function_name)
-            except RuntimeError as exc:
-                if kind == "web":
-                    return _error(f"Search tool '{search_tool_name}' cannot search the web: {exc}")
-                LOGGER.warning("deep_research_search_kind_unavailable", kind=kind, error=str(exc))
-                channel_warnings.append(f"search kind '{kind}' unavailable: {exc}")
+        try:
+            search_functions, channel_warnings = _resolve_search_functions(
+                search_toolkit,
+                toolkit_functions(search_toolkit),
+                search_function=self.search_function,
+            )
+        except RuntimeError as exc:
+            return _error(f"Search tool '{search_tool_name}' cannot search the web: {exc}")
 
         # Extra search channels degrade gracefully: an unavailable channel is
         # dropped (and reported in warnings) instead of failing the run, and
@@ -840,7 +913,7 @@ _CONFIG_FIELDS = [
         default="",
         description=(
             "Search-tool function used for every query kind. Leave empty for Serper's "
-            "search_web / search_news / search_scholar routing."
+            "serper_search (web/news/scholar) or legacy search_web / search_news / search_scholar routing."
         ),
     ),
     ConfigField(

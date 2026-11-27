@@ -63,7 +63,7 @@ Configure optional settings on the agent's `deep_research` entry in `config.yaml
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `search_tool` | `serper` | Registered MindRoom tool (built-in or plugin) used for web search. |
-| `search_function` | `""` | Single function on `search_tool` used for every query kind. Leave empty for Serper's `search_web` / `search_news` / `search_scholar` routing. |
+| `search_function` | `""` | Single function on `search_tool` used for every query kind. Leave empty for Serper's `serper_search` (`web`/`news`/`scholar`) or legacy `search_web` / `search_news` / `search_scholar` routing. |
 | `search_channels` | `[]` | Extra named search backends (`web`, `news`, `scholar` are reserved) the reasoner queries by `kind`. Use JSON object strings in per-agent config. |
 
 <details>
