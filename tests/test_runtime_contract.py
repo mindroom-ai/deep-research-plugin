@@ -8,6 +8,7 @@ instead of silently degraded behavior at dispatch time.
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING
 
 from mindroom.config.main import Config
@@ -64,4 +65,11 @@ def test_toolkit_and_result_contracts(tmp_path: Path) -> None:
         worker_target=None,
     )
     assert getattr(serper, "api_key", None) == "k"
-    assert {"search_web", "search_news", "search_scholar"} <= set(toolkit_functions(serper))
+    serper_functions = toolkit_functions(serper)
+    if "serper_search" in serper_functions:
+        assert {"query", "action", "num_results"} <= set(
+            inspect.signature(serper_functions["serper_search"]).parameters,
+        )
+        assert callable(getattr(serper, "offered_function", None))
+    else:
+        assert {"search_web", "search_news", "search_scholar"} <= set(serper_functions)

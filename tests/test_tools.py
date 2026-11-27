@@ -9,10 +9,11 @@ import importlib
 import json
 import os
 import sys
+from dataclasses import replace
 from importlib import util
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
@@ -189,7 +190,17 @@ def test_plugin_discovery_registers_tool_and_builtin_dependencies_resolve(tmp_pa
     assert serper_dependencies in {("requests",), ("httpx",)}
     assert serper_dependencies in checked_dependency_sets
     assert ("httpx", "beautifulsoup4") in checked_dependency_sets
-    assert {"search_web", "search_news", "search_scholar"} <= set(toolkit_functions(serper))
+    serper_functions = toolkit_functions(serper)
+    assert {"search_web", "search_news", "search_scholar"} <= set(
+        serper_functions
+    ) or "serper_search" in serper_functions
+    resolved_search, search_warnings = _load_tools_module()._resolve_search_functions(
+        serper,
+        serper_functions,
+        search_function="",
+    )
+    assert list(resolved_search) == ["web", "news", "scholar"]
+    assert search_warnings == []
     assert "read_url" in toolkit_functions(website)
 
 
@@ -1092,7 +1103,13 @@ def test_search_toolkit_keeps_the_searches_an_agent_hid_from_itself(tmp_path: Pa
         worker_target=None,
     )
 
-    assert {"search_web", "search_news", "search_scholar"} <= set(toolkit_functions(toolkit))
+    resolved_search, search_warnings = module._resolve_search_functions(
+        toolkit,
+        toolkit_functions(toolkit),
+        search_function="",
+    )
+    assert list(resolved_search) == ["web", "news", "scholar"]
+    assert search_warnings == []
     assert toolkit.num_results == 7
 
 
@@ -1858,3 +1875,317 @@ async def test_ask_model_sends_one_prompt_with_its_schema_through_the_owned_runt
         result = await module._ask_model(provider, "Plan.", schema=module.ResearchStep)
     assert result is step
     complete.assert_awaited_once_with(provider, "Plan.", schema=module.ResearchStep)
+
+
+@pytest.mark.asyncio
+async def test_consolidated_serper_search_routes_web_news_and_scholar() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+    calls: list[tuple[str, str | None, int | None]] = []
+
+    class ConsolidatedSerper(Toolkit):
+        name = "serper_tools"
+        api_key = "test-key"
+
+        @tool
+        def serper_search(
+            self,
+            query: str,
+            action: Literal["web", "news", "scholar"] | None = None,
+            num_results: int | None = None,
+        ) -> str:
+            calls.append((query, action, num_results))
+            return json.dumps(
+                {"organic": [{"link": f"https://example.com/{action}", "title": action, "snippet": query}]}
+            )
+
+        @tool
+        def scrape_webpage(self, _url: str) -> str:
+            return json.dumps({"text": "scraped"})
+
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
+        if name == "serper":
+            return ConsolidatedSerper()
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    async def fake_loop(**kwargs: Any) -> Any:
+        loop_mod = _load_loop_module()
+        assert [name for name, _description in kwargs["search_channels"]] == ["web", "news", "scholar"]
+        for kind, limit in [("web", 5), ("news", 4), ("scholar", 3), ("unknown", 2)]:
+            hits = await kwargs["search_fn"](loop_mod.SearchQuery(query=f"q-{kind}", kind=kind), limit)
+            expected_action = "web" if kind == "unknown" else kind
+            assert hits[0].url == f"https://example.com/{expected_action}"
+        return _result(module)
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_model_provider", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", side_effect=fake_loop),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+    assert result["warnings"] == []
+    assert calls == [
+        ("q-web", "web", 5),
+        ("q-news", "news", 4),
+        ("q-scholar", "scholar", 3),
+        ("q-unknown", "web", 2),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_consolidated_serper_search_works_async_and_without_num_results() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+    calls: list[tuple[str, str]] = []
+
+    class AsyncMinimalSerper(Toolkit):
+        name = "serper_tools"
+        api_key = "test-key"
+
+        @tool
+        async def serper_search(self, query: str, action: str = "web") -> str:
+            calls.append((query, action))
+            return json.dumps({"organic": []})
+
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
+        if name == "serper":
+            return AsyncMinimalSerper()
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    async def fake_loop(**kwargs: Any) -> Any:
+        loop_mod = _load_loop_module()
+        await kwargs["search_fn"](loop_mod.SearchQuery(query="async web", kind="web"), 6)
+        await kwargs["search_fn"](loop_mod.SearchQuery(query="async news", kind="news"), 6)
+        await kwargs["search_fn"](loop_mod.SearchQuery(query="async scholar", kind="scholar"), 6)
+        return _result(module)
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_model_provider", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", side_effect=fake_loop),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+    assert calls == [("async web", "web"), ("async news", "news"), ("async scholar", "scholar")]
+
+
+@pytest.mark.asyncio
+async def test_consolidated_serper_search_degrades_disabled_actions_via_offered_function() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+    calls: list[tuple[str, str | None, int | None]] = []
+
+    class RestrictedSerper(Toolkit):
+        name = "serper_tools"
+        api_key = "test-key"
+
+        def offered_function(self, function: Any) -> Any:
+            if function.name != "serper_search":
+                return function
+            props = dict(function.parameters["properties"])
+            props["action"] = {**props["action"], "enum": ["web", "scholar"]}
+            return replace(function, parameters={**function.parameters, "properties": props})
+
+        @tool
+        def serper_search(
+            self,
+            query: str,
+            action: Literal["web", "news", "scholar"] | None = None,
+            num_results: int | None = None,
+        ) -> str:
+            calls.append((query, action, num_results))
+            return json.dumps({"organic": []})
+
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
+        if name == "serper":
+            return RestrictedSerper()
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    loop = AsyncMock(return_value=_result(module))
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_model_provider", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", loop),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+        search_fn = loop.await_args.kwargs["search_fn"]
+        await search_fn(_load_loop_module().SearchQuery(query="latest", kind="news"), 3)
+        await search_fn(_load_loop_module().SearchQuery(query="paper", kind="scholar"), 4)
+
+    assert result["status"] == "ok"
+    assert [name for name, _description in loop.await_args.kwargs["search_channels"]] == ["web", "scholar"]
+    assert any("news" in warning and "serper_search" in warning for warning in result["warnings"])
+    assert calls == [("latest", "web", 3), ("paper", "scholar", 4)]
+
+
+@pytest.mark.asyncio
+async def test_consolidated_serper_search_fails_before_research_when_web_action_is_disabled() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+    loop = AsyncMock(return_value=_result(module))
+
+    class NewsOnlySerper(Toolkit):
+        name = "serper_tools"
+        api_key = "test-key"
+
+        def offered_function(self, function: Any) -> Any:
+            if function.name != "serper_search":
+                return function
+            props = dict(function.parameters["properties"])
+            props["action"] = {**props["action"], "enum": ["news"]}
+            return replace(function, parameters={**function.parameters, "properties": props})
+
+        @tool
+        def serper_search(
+            self,
+            query: str,
+            action: Literal["web", "news", "scholar"] | None = None,
+            num_results: int | None = None,
+        ) -> str:
+            return json.dumps({"organic": []})
+
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
+        if name == "serper":
+            return NewsOnlySerper()
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_model_provider", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", loop),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "error"
+    assert "serper_search" in result["message"]
+    assert "web" in result["message"]
+    loop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_serper_functions_take_precedence_over_serper_search() -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+    legacy_calls: list[tuple[str, str]] = []
+
+    class DualSerper(Toolkit):
+        name = "serper"
+        api_key = "test-key"
+
+        @tool
+        def search_web(self, query: str, num_results: int | None = None) -> str:
+            legacy_calls.append(("web", query))
+            return json.dumps({"organic": []})
+
+        @tool
+        def search_news(self, query: str, num_results: int | None = None) -> str:
+            legacy_calls.append(("news", query))
+            return json.dumps({"organic": []})
+
+        @tool
+        def search_scholar(self, query: str, num_results: int | None = None) -> str:
+            legacy_calls.append(("scholar", query))
+            return json.dumps({"organic": []})
+
+        @tool
+        def serper_search(self, query: str, action: str = "web", num_results: int | None = None) -> str:
+            msg = "legacy per-kind functions should take precedence"
+            raise AssertionError(msg)
+
+    def tool_by_name(name: str, *_args: Any, **_kwargs: Any) -> Any:
+        if name == "serper":
+            return DualSerper()
+        if name == "website":
+            return _FakeWebsite()
+        raise AssertionError(name)
+
+    async def fake_loop(**kwargs: Any) -> Any:
+        loop_mod = _load_loop_module()
+        await kwargs["search_fn"](loop_mod.SearchQuery(query="w", kind="web"), 3)
+        await kwargs["search_fn"](loop_mod.SearchQuery(query="n", kind="news"), 3)
+        await kwargs["search_fn"](loop_mod.SearchQuery(query="s", kind="scholar"), 3)
+        return _result(module)
+
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_model_provider", return_value=object()),
+        patch.object(module, "get_tool_by_name", side_effect=tool_by_name),
+        patch.object(module, "run_research_loop", side_effect=fake_loop),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+    assert legacy_calls == [("web", "w"), ("news", "n"), ("scholar", "s")]
+
+
+@pytest.mark.asyncio
+async def test_real_serper_toolkit_disabled_news_degrades_and_disabled_web_fails(tmp_path: Path) -> None:
+    module = _load_tools_module()
+    tools = module.DeepResearchTools()
+    runtime_paths = resolve_primary_runtime_paths(config_path=tmp_path / "config.yaml")
+    plugins = config_plugins(Config(), runtime_paths)
+
+    no_news_serper = resolve_tool_by_name(
+        "serper",
+        runtime_paths,
+        tools=plugins.tools,
+        credential_overrides={"api_key": "k"},
+        tool_config_overrides={"enable_search_news": False},
+        worker_target=None,
+    )
+    loop = AsyncMock(return_value=_result(module))
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_model_provider", return_value=object()),
+        patch.object(
+            module,
+            "get_tool_by_name",
+            side_effect=lambda name, *_a, **_kw: no_news_serper if name == "serper" else _FakeWebsite(),
+        ),
+        patch.object(module, "run_research_loop", loop),
+    ):
+        result = json.loads(await tools.deep_research("What?"))
+
+    assert result["status"] == "ok"
+    assert [name for name, _description in loop.await_args.kwargs["search_channels"]] == ["web", "scholar"]
+    assert any("news" in warning for warning in result["warnings"])
+
+    no_web_serper = resolve_tool_by_name(
+        "serper",
+        runtime_paths,
+        tools=plugins.tools,
+        credential_overrides={"api_key": "k"},
+        tool_config_overrides={"enable_search": False, "enable_search_news": True},
+        worker_target=None,
+    )
+    no_web_loop = AsyncMock(return_value=_result(module))
+    with (
+        tool_runtime_context(_tool_context(sender=AsyncMock())),
+        patch.object(module, "build_model_provider", return_value=object()),
+        patch.object(
+            module,
+            "get_tool_by_name",
+            side_effect=lambda name, *_a, **_kw: no_web_serper if name == "serper" else _FakeWebsite(),
+        ),
+        patch.object(module, "run_research_loop", no_web_loop),
+    ):
+        no_web_result = json.loads(await tools.deep_research("What?"))
+
+    assert no_web_result["status"] == "error"
+    assert "cannot search the web" in no_web_result["message"]
+    no_web_loop.assert_not_awaited()
